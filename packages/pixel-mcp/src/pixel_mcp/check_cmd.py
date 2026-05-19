@@ -142,9 +142,13 @@ def run(
         deltas, tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking)
     )
 
-    # --- 4) Level 0 visual signals: SSIM + Hot Regions ---
-    ssim_score, hot_regions, visual_error = _compute_visual_signals(
-        figma_url=figma_url, route=route, viewport=viewport, wait_for=wait_for
+    # --- 4) Level 0 visual signals: SSIM + Hot Regions + decomposition ---
+    ssim_score, hot_regions, regions, visual_error = _compute_visual_signals(
+        figma_url=figma_url,
+        route=route,
+        viewport=viewport,
+        wait_for=wait_for,
+        dom=dom,
     )
 
     # Combined Level 0 Gate Pass: structured Deltas AND visual signals must hold.
@@ -166,6 +170,7 @@ def run(
         truncated=truncated,
         ssim_score=ssim_score,
         hot_regions=hot_regions,
+        regions=regions,
         visual_error=visual_error,
         overall_converged=overall_converged,
     )
@@ -182,14 +187,19 @@ MIN_BBOX_AREA = 100
 
 
 def _compute_visual_signals(
-    *, figma_url: str, route: str, viewport: tuple[int, int], wait_for: str | None
-) -> tuple[float | None, list[BoundingBox], str | None]:
-    """Best-effort visual diff. Returns ``(ssim, hot_regions, error_message)``.
+    *,
+    figma_url: str,
+    route: str,
+    viewport: tuple[int, int],
+    wait_for: str | None,
+    dom: MeasuredDOM,
+) -> tuple[float | None, list[BoundingBox], list[Any], str | None]:
+    """Best-effort visual diff + decomposition.
 
-    A non-None ``error_message`` means the visual signal could not be computed
-    (e.g. Figma did not return a PNG, OpenCV failed to align images). When
-    that happens, the caller treats the visual signal as "missing" — Gate
-    Pass falls back to the structured Deltas verdict and emits a hint.
+    Returns ``(ssim, hot_regions, regions, error_message)``. A non-None
+    ``error_message`` means the visual signal could not be computed (e.g.
+    Figma did not return a PNG). The caller falls back to the structured
+    Deltas verdict and emits a hint.
     """
     try:
         # Lazy imports — keep cv2/skimage out of the critical path when
@@ -199,6 +209,7 @@ def _compute_visual_signals(
         import numpy as np  # noqa: PLC0415
         from PIL import Image  # noqa: PLC0415
 
+        from pixel_mcp.decompose import decompose_hot_regions  # noqa: PLC0415
         from pixel_mcp.figma_client import FigmaClient  # noqa: PLC0415
         from pixel_mcp.figma_url import parse_figma_url  # noqa: PLC0415
         from pixel_mcp.hot_regions import (  # noqa: PLC0415
@@ -215,16 +226,22 @@ def _compute_visual_signals(
         actual_img = np.array(Image.open(io.BytesIO(actual_png)).convert("RGB"))
 
         ssim = compute_ssim(expected_img, actual_img)
-        regions = compute_hot_regions(
+        bboxes = compute_hot_regions(
             expected_img,
             actual_img,
             min_bbox_area=MIN_BBOX_AREA,
         )
-        return ssim, regions, None
+        regions = decompose_hot_regions(
+            bboxes,
+            dom,
+            expected_image=expected_img,
+            actual_image=actual_img,
+        )
+        return ssim, bboxes, regions, None
     except Exception as exc:  # noqa: BLE001
         # Visual signal is best-effort. Any failure → Gate Pass falls back
         # to the structured-Delta verdict, and the envelope explains why.
-        return None, [], str(exc)
+        return None, [], [], str(exc)
 
 
 def _success_envelope(
@@ -236,11 +253,13 @@ def _success_envelope(
     truncated: bool,
     ssim_score: float | None = None,
     hot_regions: list[BoundingBox] | None = None,
+    regions: list[Any] | None = None,
     visual_error: str | None = None,
     overall_converged: bool | None = None,
 ) -> Envelope:
     delta_dicts = [json.loads(d.model_dump_json()) for d in deltas]
     hot_regions = hot_regions or []
+    regions = regions or []
     significant_regions = [r for r in hot_regions if r.w * r.h >= MIN_BBOX_AREA]
     data: dict[str, Any] = {
         "converged": overall_converged
@@ -254,6 +273,7 @@ def _success_envelope(
         "ssim_threshold": SSIM_THRESHOLD,
         "hot_regions": [json.loads(r.model_dump_json()) for r in hot_regions],
         "significant_hot_region_count": len(significant_regions),
+        "regions": [json.loads(r.model_dump_json()) for r in regions],
         "visual_error": visual_error,
         "spec_node_id": spec.figma_node_id,
         "dom_route": dom.route,
