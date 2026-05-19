@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pixel_tools_shared import Envelope, make_envelope
 
@@ -817,8 +817,11 @@ def _run_vlm_gate(
         }
 
     pairs = [(exp, act) for _idx, exp, act, _sel in eligible]
+    backend_literal: Literal["claude", "qwen-local"] = (
+        "qwen-local" if vlm_backend == "qwen-local" else "claude"
+    )
     try:
-        verdicts = compute_vlm_judgment_batch(pairs, backend=vlm_backend)
+        verdicts = compute_vlm_judgment_batch(pairs, backend=backend_literal)
     except VLMNotInstalledError:
         return {
             "judgments": [],
