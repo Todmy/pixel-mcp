@@ -1,8 +1,8 @@
 """Typer entry point — `pixel-mcp <verb>`.
 
 Slice 1 implements `doctor` and `mcp`; Slice 2 adds `spec`; Slice 3 adds
-`measure`. Every other subcommand is a stub that points at the tracking
-issue and exits non-zero.
+`measure`; Slice 4 adds `diff`, `judge`, `check`. Remaining subcommands
+are stubs pointing at their tracking issue.
 """
 
 from __future__ import annotations
@@ -15,7 +15,10 @@ from typing import Optional
 import typer
 from pixel_tools_shared import Envelope
 
+from pixel_mcp import check_cmd as check_cmd_mod
+from pixel_mcp import diff_cmd as diff_cmd_mod
 from pixel_mcp import doctor as doctor_mod
+from pixel_mcp import judge_cmd as judge_cmd_mod
 from pixel_mcp import measure_cmd as measure_cmd_mod
 from pixel_mcp import spec_cmd as spec_cmd_mod
 from pixel_mcp.version import __version__
@@ -186,21 +189,116 @@ def measure(
 
 
 @app.command()
-def diff() -> None:
-    """Compute Deltas between DesignSpec and MeasuredDOM. (stub)"""
-    _stub("diff", 14)
+def diff(
+    spec: Path = typer.Option(  # noqa: B008
+        ...,
+        "--spec",
+        help="Path to a DesignSpec JSON (produced by `pixel-mcp spec --out`).",
+    ),
+    measured: Path = typer.Option(  # noqa: B008
+        ...,
+        "--measured",
+        help="Path to a MeasuredDOM JSON (produced by `pixel-mcp measure --out`).",
+    ),
+    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+        None,
+        "--out",
+        help="Write the AXI envelope JSON to this file. Defaults to stdout.",
+    ),
+) -> None:
+    """Compute Deltas between DesignSpec and MeasuredDOM."""
+    envelope, exit_code = diff_cmd_mod.run(spec_path=spec, measured_path=measured)
+    _emit(envelope, out)
+    raise typer.Exit(code=exit_code)
 
 
 @app.command()
-def judge() -> None:
-    """Run the Convergence Judge for the current Iteration. (stub)"""
-    _stub("judge", 14)
+def judge(
+    deltas: Path = typer.Option(  # noqa: B008
+        ...,
+        "--deltas",
+        help="Path to a Delta[] JSON (top-level array or AXI envelope with data.deltas).",
+    ),
+    strict: bool = typer.Option(  # noqa: B008
+        False,
+        "--strict",
+        help="Treat minor Deltas as blocking.",
+    ),
+    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+        None,
+        "--out",
+        help="Write the AXI envelope JSON to this file. Defaults to stdout.",
+    ),
+) -> None:
+    """Run the Convergence Judge over a Delta[]."""
+    envelope, exit_code = judge_cmd_mod.run(deltas_path=deltas, treat_minor_as_blocking=strict)
+    _emit(envelope, out)
+    raise typer.Exit(code=exit_code)
 
 
 @app.command()
-def check() -> None:
-    """One Iteration of the Convergence Loop. (stub)"""
-    _stub("check", 14)
+def check(
+    figma: str = typer.Option(  # noqa: B008
+        ...,
+        "--figma",
+        help="Figma URL — Frame, Component Instance, or Master Component.",
+    ),
+    route: str = typer.Option(  # noqa: B008
+        ...,
+        "--route",
+        help="URL of the Render (e.g. http://localhost:3000/foo).",
+    ),
+    selectors: Optional[str] = typer.Option(  # noqa: B008, UP007
+        None,
+        "--selectors",
+        help="Comma-separated CSS selectors to measure. Auto-discover when omitted.",
+    ),
+    viewport: str = typer.Option(  # noqa: B008
+        "1280x720",
+        "--viewport",
+        help="Viewport size as WIDTHxHEIGHT (default 1280x720).",
+    ),
+    wait_for: Optional[str] = typer.Option(  # noqa: B008, UP007
+        None,
+        "--wait-for",
+        help="CSS selector that must appear before measurement begins.",
+    ),
+    refresh_spec: bool = typer.Option(  # noqa: B008
+        False,
+        "--refresh-spec",
+        help="Bypass the spec-cache and re-fetch from the Figma API.",
+    ),
+    strict: bool = typer.Option(  # noqa: B008
+        False,
+        "--strict",
+        help="Treat minor Deltas as blocking.",
+    ),
+    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+        None,
+        "--out",
+        help="Write the AXI envelope JSON to this file. Defaults to stdout.",
+    ),
+) -> None:
+    """One Iteration of the Convergence Loop — spec + measure + diff + judge."""
+    envelope, exit_code = check_cmd_mod.run(
+        figma_url=figma,
+        route=route,
+        viewport=_parse_viewport(viewport),
+        selectors=_parse_selectors(selectors),
+        wait_for=wait_for,
+        refresh_spec=refresh_spec,
+        treat_minor_as_blocking=strict,
+    )
+    _emit(envelope, out)
+    raise typer.Exit(code=exit_code)
+
+
+def _emit(envelope: Envelope, out: Path | None) -> None:
+    payload = json.dumps(envelope, indent=2, default=str)
+    if out is not None:
+        out.write_text(payload)
+    else:
+        typer.echo(payload)
 
 
 @app.command()

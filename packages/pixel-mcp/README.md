@@ -4,18 +4,39 @@ Figma to Browser convergence harness with escalation gates. CLI plus MCP server.
 
 This package is the core, published artifact. See the [repo README](../../README.md) for installation and Claude Code wiring.
 
-## Surface (Slice 3)
+## Surface (Slice 4)
 
 Implemented:
 - `pixel-mcp doctor` — environment Check, returns AXI envelope.
 - `pixel-mcp spec --figma <url>` — extract a DesignSpec from a Figma Source.
 - `pixel-mcp measure --route <url>` — capture a MeasuredDOM from a Render.
-- `pixel-mcp mcp` — launch the MCP server over stdio. Exposes tools: `doctor`, `spec`, `measure`.
+- `pixel-mcp diff --spec X --measured Y` — compute Deltas between a DesignSpec and a MeasuredDOM.
+- `pixel-mcp judge --deltas X [--strict]` — run the ConvergenceJudge over a Delta[].
+- `pixel-mcp check --figma <url> --route <url>` — one Iteration of the Convergence Loop (composite).
+- `pixel-mcp mcp` — launch the MCP server over stdio. Exposes tools: `doctor`, `spec`, `measure`, `diff`, `judge`, `check`.
 
 Stubbed (one issue per slice):
-- `diff`, `judge`, `check`, `review`, `mapping`, `snapshot`, `reset`.
+- `review`, `mapping`, `snapshot`, `reset`.
 
 Each stub prints the tracking issue and exits non-zero.
+
+## `pixel-mcp check`
+
+The composite — one Iteration of the Convergence Loop. Calls `spec`, `measure`,
+`diff`, and `judge` in sequence and returns a single AXI envelope.
+
+```sh
+pixel-mcp check --figma 'https://www.figma.com/design/<id>?node-id=<n>' \
+                --route http://localhost:3000/component
+```
+
+Exit codes drive Loop Runners (Ralph Loop, Makefile, CI):
+- `0` — Final Convergence at the highest enabled Level (v0 = Level 0).
+- `1` — Deltas present; the Agent should fix and re-invoke.
+- `12` — Fatal (Figma/Render/IO).
+
+The envelope's `data` carries `{converged, deltas, judgment, ssim_score: null, hot_regions: []}` —
+the latter two are reserved for Slice 6.
 
 ## Setup — Playwright + Chromium
 
