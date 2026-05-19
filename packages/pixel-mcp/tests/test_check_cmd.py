@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pixel_mcp.check_cmd import (
@@ -198,6 +200,193 @@ def test_check_truncated_dom_emits_hint(mocked_pipeline: Any) -> None:
         route="http://localhost:3000/",
     )
     assert any("200-element cap" in h or "narrow with --selectors" in h for h in envelope["hints"])
+
+
+# ---------------------------------------------------------------------------
+# Level 1 (DINOv2) gate — v0.5-3
+# ---------------------------------------------------------------------------
+
+
+def _regions_with_crops(tmp_path: Path, count: int = 2) -> list[Any]:
+    """Build fake Region objects with expected_crop_path / actual_crop_path set.
+
+    The DINOv2 gate iterates ``regions`` — each must expose those attributes
+    plus ``leaf_selector``. We don't go through the real decomposer here
+    because the gate code only reads the four attributes.
+    """
+    from pixel_mcp.decompose import Region
+    from pixel_mcp.render import BoundingBox
+
+    out: list[Region] = []
+    for i in range(count):
+        exp = tmp_path / f"exp_{i}.png"
+        act = tmp_path / f"act_{i}.png"
+        exp.write_bytes(b"fake-expected-png")
+        act.write_bytes(b"fake-actual-png")
+        out.append(
+            Region(
+                bbox=BoundingBox(x=0, y=0, w=10, h=10),
+                area_px2=100.0,
+                severity="minor",
+                leaf_selector=f"#region-{i}",
+                expected_crop_path=str(exp),
+                actual_crop_path=str(act),
+            )
+        )
+    return out
+
+
+def _patch_visual_signals(regions: list[Any]) -> Any:
+    """Patch ``_compute_visual_signals`` to return a passing Level 0 + given regions."""
+    return patch(
+        "pixel_mcp.check_cmd._compute_visual_signals",
+        return_value=(0.99, [], regions, None),
+    )
+
+
+def test_dinov2_gate_skipped_when_disabled(mocked_pipeline: Any, tmp_path: Path) -> None:
+    """No DINOv2 import attempted when --enable-dinov2 is off (default)."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path)
+
+    with (
+        _patch_visual_signals(regions),
+        patch("pixel_mcp.check_cmd._run_dinov2_gate") as m_gate,
+    ):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+        )
+
+    assert exit_code == EXIT_CONVERGED
+    assert m_gate.call_count == 0
+    assert envelope["data"]["dinov2_enabled"] is False
+    assert envelope["data"]["dinov2_threshold"] is None
+    assert envelope["data"]["dinov2_similarities"] is None
+    assert envelope["data"]["level_reached"] == 0  # Level 0 only
+
+
+def test_dinov2_gate_runs_after_level0_pass(mocked_pipeline: Any, tmp_path: Path) -> None:
+    """When --enable-dinov2 and Level 0 passes, all crops scored; level_reached=1."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=2)
+
+    fake_batch = MagicMock(return_value=[0.99, 0.98])
+    fake_pkg = types.ModuleType("pixel_mcp_ml")
+    fake_pkg.compute_dinov2_similarity_batch = fake_batch  # type: ignore[attr-defined]
+
+    with (
+        _patch_visual_signals(regions),
+        patch.dict(sys.modules, {"pixel_mcp_ml": fake_pkg}),
+    ):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_dinov2=True,
+        )
+
+    assert exit_code == EXIT_CONVERGED
+    assert envelope["data"]["converged"] is True
+    assert envelope["data"]["level_reached"] == 1
+    assert envelope["data"]["dinov2_enabled"] is True
+    assert envelope["data"]["dinov2_threshold"] == pytest.approx(0.95)
+    sims = envelope["data"]["dinov2_similarities"]
+    assert isinstance(sims, list) and len(sims) == 2
+    assert all(s["similarity"] >= 0.95 for s in sims)
+
+
+def test_dinov2_gate_fails_with_low_similarity(mocked_pipeline: Any, tmp_path: Path) -> None:
+    """One low score → overall_converged=False, one pseudo-Delta emitted."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=2)
+
+    fake_batch = MagicMock(return_value=[0.5, 0.99])  # first crop fails (gap=0.45)
+    fake_pkg = types.ModuleType("pixel_mcp_ml")
+    fake_pkg.compute_dinov2_similarity_batch = fake_batch  # type: ignore[attr-defined]
+
+    with (
+        _patch_visual_signals(regions),
+        patch.dict(sys.modules, {"pixel_mcp_ml": fake_pkg}),
+    ):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_dinov2=True,
+        )
+
+    assert exit_code == EXIT_DELTAS
+    assert envelope["data"]["converged"] is False
+    assert envelope["data"]["level_reached"] == 0
+    # One pseudo-Delta for the failing crop, with property dinov2_similarity_*
+    dinov2_deltas = [
+        d for d in envelope["data"]["deltas"] if d["property"].startswith("dinov2_similarity_")
+    ]
+    assert len(dinov2_deltas) == 1
+    assert dinov2_deltas[0]["severity"] == "critical"  # gap 0.45 >= 0.15 → critical
+
+
+def test_dinov2_gate_graceful_fallback_when_ml_missing(
+    mocked_pipeline: Any, tmp_path: Path
+) -> None:
+    """If pixel_mcp_ml can't be imported, hint surfaces and check doesn't crash."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=1)
+
+    # Force ImportError by sabotaging sys.modules with an object that raises.
+    with (
+        _patch_visual_signals(regions),
+        patch.dict(sys.modules, {"pixel_mcp_ml": None}),  # ImportError on import
+    ):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_dinov2=True,
+        )
+
+    # Graceful fallback: Level 0 verdict stands (converged from mocks above),
+    # an AXI hint mentions the install command, no crash.
+    assert exit_code == EXIT_CONVERGED
+    assert envelope["data"]["converged"] is True
+    assert envelope["data"]["level_reached"] == 0  # didn't reach Level 1
+    hints_text = " ".join(envelope["hints"])
+    assert "pixel-mcp-ml" in hints_text
+    assert "--extra dinov2" in hints_text
+
+
+def test_dinov2_gate_batched_loads_model_once(mocked_pipeline: Any, tmp_path: Path) -> None:
+    """The gate calls compute_dinov2_similarity_batch ONCE for N crops, not N times."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=3)
+
+    fake_batch = MagicMock(return_value=[0.99, 0.98, 0.97])
+    fake_pkg = types.ModuleType("pixel_mcp_ml")
+    fake_pkg.compute_dinov2_similarity_batch = fake_batch  # type: ignore[attr-defined]
+
+    with (
+        _patch_visual_signals(regions),
+        patch.dict(sys.modules, {"pixel_mcp_ml": fake_pkg}),
+    ):
+        envelope, _exit = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_dinov2=True,
+        )
+
+    assert fake_batch.call_count == 1
+    # And it received all 3 (expected, actual) pairs in one call.
+    pairs_arg = fake_batch.call_args[0][0]
+    assert len(pairs_arg) == 3
+    assert envelope["data"]["level_reached"] == 1
 
 
 def test_check_writes_envelope_via_cli(tmp_path: Path, mocked_pipeline: Any) -> None:

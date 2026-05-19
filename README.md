@@ -53,6 +53,47 @@ uv run pytest                 # tests
 uv run pre-commit install     # wire git hooks
 ```
 
+## Project config (`.pixel-mcp.json`, optional)
+
+Drop a `.pixel-mcp.json` at the project root to override built-in defaults.
+CLI flags > config file > built-in defaults.
+
+| Key | Default | Notes |
+|---|---|---|
+| `max_iterations` | `15` | Loop ceiling per session |
+| `stuck_threshold` | `3` | Identical delta-hash count that trips STUCK |
+| `enabled_levels` | `[0]` | Escalation gates active for this project |
+| `ssim_threshold` | `0.97` | Level 0 SSIM Gate Pass |
+| `min_bbox_area` | `100` | Hot Region filter (px²) |
+| `enable_dinov2` | `false` | Opt in to Level 1 (DINOv2 per-crop similarity) |
+| `dinov2_threshold` | `0.95` | Cosine-similarity threshold for Level 1 Gate Pass |
+| `viewport` | `{width: 1280, height: 720}` | Default browser viewport |
+| `mask_regions` | `[]` | CSS selectors to mask from visual diff |
+
+### Level 1 (DINOv2) escalation gate
+
+Once Level 0 (CV) Gate-Passes, DINOv2 scores every residual Hot Region crop
+(expected vs actual) with cosine similarity over CLS-token embeddings. Pass
+condition: every crop's similarity ≥ `dinov2_threshold`. Any failing crop
+emits a pseudo-Delta (`property=dinov2_similarity_<n>`) with severity
+derived from the similarity gap:
+
+- gap ≥ 0.15 → critical
+- gap ≥ 0.05 → major
+- otherwise → minor
+
+The gate is **opt-in**: pass `--enable-dinov2` on the CLI, set
+`enable_dinov2: true` in `.pixel-mcp.json`, or pass `enable_dinov2=true` to
+the MCP `check` tool. Requires the ML extras:
+
+```sh
+uv tool install pixel-mcp-ml --extra dinov2
+```
+
+If the extras aren't installed but the gate is enabled, `check` falls back
+to the Level 0 verdict and emits an AXI hint with the install command — it
+never crashes the loop.
+
 ## Project layout
 
 ```

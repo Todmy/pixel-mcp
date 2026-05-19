@@ -55,6 +55,8 @@ class ProjectConfig(BaseModel):
     tolerance: Tolerance = Field(default_factory=Tolerance)
     ssim_threshold: float = 0.97
     min_bbox_area: int = 100
+    enable_dinov2: bool = False
+    dinov2_threshold: float = 0.95
     viewport: ViewportConfig = Field(default_factory=ViewportConfig)
     mask_regions: list[MaskRegion] = Field(default_factory=list)
     figma_token_env: str = "FIGMA_TOKEN"

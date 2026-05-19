@@ -89,6 +89,8 @@ def run(
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     stuck_threshold: int = DEFAULT_STUCK_THRESHOLD,
     image_path: str | Path | None = None,
+    enable_dinov2: bool = False,
+    dinov2_threshold: float = 0.95,
 ) -> tuple[Envelope, int]:
     """Run one Iteration of the Convergence Loop.
 
@@ -301,10 +303,40 @@ def run(
     else:
         overall_converged = judgment.converged and visual_passes
 
+    # --- 4c) Level 1 (DINOv2) gate, opt-in ---
+    # Only runs once Level 0 has Gate-Passed. ``level_reached`` reflects the
+    # highest gate satisfied: 0 means Level 0 (CV) is the ceiling, 1 means
+    # DINOv2 also passed. If any crop fails the threshold, we synthesize one
+    # pseudo-Delta per failing crop and revert overall_converged to False.
+    level_reached = 0
+    dinov2_similarities: list[dict[str, Any]] | None = None
+    dinov2_hint: str | None = None
+    if enable_dinov2 and overall_converged:
+        dinov2_result = _run_dinov2_gate(
+            regions=regions,
+            dinov2_threshold=dinov2_threshold,
+        )
+        dinov2_similarities = dinov2_result["similarities"]
+        dinov2_hint = dinov2_result["hint"]
+        failing = dinov2_result["failing_deltas"]
+        if dinov2_result["promoted"]:
+            # Achieved Level 1; next un-implemented gate is Level 2 (VLM, v1 scope).
+            level_reached = 1
+        if failing:
+            # ANY crop fail → Level 1 not satisfied; revert convergence.
+            overall_converged = False
+            level_reached = 0
+            # Append the pseudo-Deltas so loop-economics / hash / history see them.
+            deltas = list(deltas) + failing
+            judgment = judge_deltas(
+                deltas,
+                tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking),
+            )
+
     # --- 5) Loop economics: stuck detection + regression + state update ---
     current_hash = hash_deltas_bucketed(deltas)
     is_stuck = detect_stuck(state.recent_hashes, current_hash, threshold=stuck_threshold)
-    current_level_passed = 1 if overall_converged else 0
+    current_level_passed = level_reached if overall_converged else 0
     is_regression = detect_regression(state, current_level_passed)
 
     state.last_delta_hash = current_hash
@@ -344,6 +376,11 @@ def run(
         is_regression=is_regression,
         max_iterations=max_iterations,
         mode=mode,
+        level_reached=level_reached,
+        dinov2_enabled=enable_dinov2,
+        dinov2_threshold=dinov2_threshold if enable_dinov2 else None,
+        dinov2_similarities=dinov2_similarities,
+        dinov2_hint=dinov2_hint,
     )
 
     if is_regression:
@@ -460,6 +497,130 @@ def _compute_visual_signals(
         return None, [], [], str(exc)
 
 
+def _dinov2_severity_for_gap(gap: float) -> str:
+    """Map similarity-gap to Delta severity per PRD #10 (DINOv2 escalation)."""
+    if gap >= 0.15:
+        return "critical"
+    if gap >= 0.05:
+        return "major"
+    return "minor"
+
+
+def _run_dinov2_gate(
+    *,
+    regions: list[Any],
+    dinov2_threshold: float,
+) -> dict[str, Any]:
+    """Run Level 1 (DINOv2) on residual crops produced by HierarchicalDecomposer.
+
+    Returns a dict with:
+    - ``similarities`` — list of per-region records (always a list; empty when
+      no crops were available). Each entry: ``{region_index, selector,
+      similarity, gap, severity}``.
+    - ``failing_deltas`` — list[Delta] of pseudo-Deltas for crops that fell
+      below ``dinov2_threshold``. Empty when every crop passed.
+    - ``promoted`` — True iff at least one crop was scored AND all crops passed.
+    - ``hint`` — optional AXI hint string (e.g. graceful-fallback notice).
+
+    Lazy import: ``pixel_mcp_ml`` is only resolved here, so the check pipeline
+    keeps working when the ML extras are not installed.
+    """
+    # Collect (region_index, expected_path, actual_path, selector) tuples.
+    eligible: list[tuple[int, Path, Path, str | None]] = []
+    for idx, region in enumerate(regions):
+        exp = getattr(region, "expected_crop_path", None)
+        act = getattr(region, "actual_crop_path", None)
+        if exp and act:
+            eligible.append(
+                (
+                    idx,
+                    Path(exp),
+                    Path(act),
+                    getattr(region, "leaf_selector", None),
+                )
+            )
+
+    if not eligible:
+        # Nothing to score → Level 0 verdict stands. No promotion.
+        return {
+            "similarities": [],
+            "failing_deltas": [],
+            "promoted": False,
+            "hint": None,
+        }
+
+    try:
+        # Lazy: keep this OUT of module top-level. The pipeline must work
+        # when ``pixel-mcp-ml`` (and torch/transformers underneath) is not
+        # installed.
+        from pixel_mcp_ml import (  # noqa: PLC0415
+            compute_dinov2_similarity_batch,
+        )
+    except ImportError:
+        return {
+            "similarities": [],
+            "failing_deltas": [],
+            "promoted": False,
+            "hint": (
+                "Level 1 enabled but `pixel-mcp-ml --extra dinov2` not installed — "
+                "falling back to Level 0 verdict. "
+                "Install: `uv tool install pixel-mcp-ml --extra dinov2`."
+            ),
+        }
+
+    pairs = [(exp, act) for _idx, exp, act, _sel in eligible]
+    try:
+        scores = compute_dinov2_similarity_batch(pairs)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "similarities": [],
+            "failing_deltas": [],
+            "promoted": False,
+            "hint": (
+                f"Level 1 (DINOv2) failed at runtime ({exc!s}). Falling back to Level 0 verdict."
+            ),
+        }
+
+    similarities: list[dict[str, Any]] = []
+    failing_deltas: list[Delta] = []
+    for (region_idx, _exp, _act, selector), score in zip(eligible, scores, strict=True):
+        gap = max(0.0, dinov2_threshold - float(score))
+        severity = _dinov2_severity_for_gap(gap)
+        similarities.append(
+            {
+                "region_index": region_idx,
+                "selector": selector,
+                "similarity": float(score),
+                "gap": gap,
+                "severity": severity,
+            }
+        )
+        if float(score) < dinov2_threshold:
+            failing_deltas.append(
+                Delta(
+                    selector=selector or f"dinov2_region_{region_idx}",
+                    figma_node_id=None,
+                    property=f"dinov2_similarity_{region_idx}",
+                    observed={
+                        "similarity": float(score),
+                        "threshold": dinov2_threshold,
+                        "gap": gap,
+                    },
+                    expected={"similarity_gte": dinov2_threshold},
+                    magnitude=gap,
+                    severity=severity,  # type: ignore[arg-type]
+                )
+            )
+
+    promoted = not failing_deltas  # all crops passed
+    return {
+        "similarities": similarities,
+        "failing_deltas": failing_deltas,
+        "promoted": promoted,
+        "hint": None,
+    }
+
+
 def _success_envelope(
     *,
     spec: DesignSpec | None,
@@ -478,6 +639,11 @@ def _success_envelope(
     is_regression: bool = False,
     max_iterations: int | None = None,
     mode: str = "figma",
+    level_reached: int = 0,
+    dinov2_enabled: bool = False,
+    dinov2_threshold: float | None = None,
+    dinov2_similarities: list[dict[str, Any]] | None = None,
+    dinov2_hint: str | None = None,
 ) -> Envelope:
     delta_dicts = [json.loads(d.model_dump_json()) for d in deltas]
     hot_regions = hot_regions or []
@@ -488,7 +654,7 @@ def _success_envelope(
         "converged": overall_converged
         if overall_converged is not None
         else judgment_data["converged"],
-        "level_reached": 0,
+        "level_reached": level_reached,
         "summary": judgment_data["summary"],
         "judgment": judgment_data,
         "deltas": delta_dicts,
@@ -506,6 +672,9 @@ def _success_envelope(
         "max_iterations": max_iterations,
         "is_stuck": is_stuck,
         "is_regression": is_regression,
+        "dinov2_enabled": dinov2_enabled,
+        "dinov2_threshold": dinov2_threshold,
+        "dinov2_similarities": dinov2_similarities,
     }
 
     hints: list[str] = _build_hints(judgment_data, deltas, truncated, mode=mode)
@@ -544,12 +713,34 @@ def _success_envelope(
                 f"Visual signal unavailable ({visual_error[:120]}). "
                 "Level 0 Gate Pass fell back to structured Deltas only."
             )
+    if dinov2_hint is not None:
+        hints.append(dinov2_hint)
+    if dinov2_enabled and dinov2_similarities:
+        failing = [s for s in dinov2_similarities if s["similarity"] < (dinov2_threshold or 0)]
+        if failing:
+            hints.append(
+                f"Level 1 (DINOv2) failed on {len(failing)} crop(s) — see data.dinov2_similarities."
+            )
+        elif level_reached >= 1:
+            hints.append(
+                f"Level 1 (DINOv2) Gate Pass: {len(dinov2_similarities)} crop(s) "
+                f"above similarity threshold {dinov2_threshold}."
+            )
 
-    next_action = (
-        "Promote to Level 1 (DINOv2 per-crop similarity) once that plugin is enabled."
-        if (overall_converged if overall_converged is not None else judgment_data["converged"])
-        else "Have the Agent fix the listed Deltas, then re-invoke `mcp__pixel_mcp__check`."
+    converged_now = (
+        overall_converged if overall_converged is not None else judgment_data["converged"]
     )
+    if not converged_now:
+        next_action = (
+            "Have the Agent fix the listed Deltas, then re-invoke `mcp__pixel_mcp__check`."
+        )
+    elif level_reached >= 1:
+        next_action = "Level 1 Gate Pass. Promote to Level 2 (VLM) once that plugin is enabled."
+    else:
+        next_action = (
+            "Promote to Level 1 (DINOv2 per-crop similarity) by re-running "
+            "`pixel-mcp check --enable-dinov2`."
+        )
 
     return make_envelope(
         data=data,

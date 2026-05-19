@@ -41,3 +41,17 @@ def test_malformed_config_raises(tmp_path: Path) -> None:
 def test_default_enabled_levels_contains_zero() -> None:
     cfg = ProjectConfig()
     assert 0 in cfg.enabled_levels
+
+
+def test_dinov2_defaults_off() -> None:
+    """Level 1 (DINOv2) is opt-in — defaults to disabled, threshold 0.95."""
+    cfg = ProjectConfig()
+    assert cfg.enable_dinov2 is False
+    assert cfg.dinov2_threshold == pytest.approx(0.95)
+
+
+def test_dinov2_overrides_via_config_file(tmp_path: Path) -> None:
+    (tmp_path / ".pixel-mcp.json").write_text('{"enable_dinov2": true, "dinov2_threshold": 0.9}')
+    cfg = load_project_config(project_root=tmp_path)
+    assert cfg.enable_dinov2 is True
+    assert cfg.dinov2_threshold == pytest.approx(0.9)

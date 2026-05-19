@@ -284,6 +284,17 @@ def check(
         "--strict",
         help="Treat minor Deltas as blocking.",
     ),
+    enable_dinov2: bool = typer.Option(  # noqa: B008
+        False,
+        "--enable-dinov2/--no-enable-dinov2",
+        help="Opt in to Level 1 (DINOv2 per-crop similarity) escalation gate. "
+        "Requires `pixel-mcp-ml --extra dinov2`.",
+    ),
+    dinov2_threshold: float = typer.Option(  # noqa: B008
+        0.95,
+        "--dinov2-threshold",
+        help="Cosine-similarity threshold for Level 1 Gate Pass (default 0.95).",
+    ),
     out: Optional[Path] = typer.Option(  # noqa: B008, UP007
         None,
         "--out",
@@ -305,6 +316,8 @@ def check(
         wait_for=wait_for,
         refresh_spec=refresh_spec,
         treat_minor_as_blocking=strict,
+        enable_dinov2=enable_dinov2,
+        dinov2_threshold=dinov2_threshold,
     )
     _emit(envelope, out)
     raise typer.Exit(code=exit_code)

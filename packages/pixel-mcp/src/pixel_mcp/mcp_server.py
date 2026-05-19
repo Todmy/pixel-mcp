@@ -149,6 +149,8 @@ def check(
     wait_for: str | None = None,
     refresh_spec: bool = False,
     treat_minor_as_blocking: bool = False,
+    enable_dinov2: bool = False,
+    dinov2_threshold: float = 0.95,
 ) -> dict[str, Any]:
     """One Iteration of the Convergence Loop.
 
@@ -169,6 +171,10 @@ def check(
         wait_for: Optional CSS selector to wait for before measuring.
         refresh_spec: Bypass the DesignSpec cache (Figma mode only).
         treat_minor_as_blocking: Strict Tolerance — minor Deltas block.
+        enable_dinov2: Opt in to Level 1 (DINOv2 per-crop similarity) gate.
+            Requires ``pixel-mcp-ml --extra dinov2`` installed.
+        dinov2_threshold: Cosine-similarity threshold for Level 1 Gate Pass
+            (default 0.95).
 
     Returns the AXI envelope wrapping ``{mode, converged, deltas, judgment, ...}``.
     """
@@ -181,6 +187,8 @@ def check(
         wait_for=wait_for,
         refresh_spec=refresh_spec,
         treat_minor_as_blocking=treat_minor_as_blocking,
+        enable_dinov2=enable_dinov2,
+        dinov2_threshold=dinov2_threshold,
     )
     serialized: dict[str, Any] = json.loads(json.dumps(envelope, default=str))
     return serialized
