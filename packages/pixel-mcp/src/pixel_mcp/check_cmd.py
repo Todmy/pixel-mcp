@@ -30,12 +30,14 @@ from pixel_mcp.figma_url import FigmaUrlError
 from pixel_mcp.judge import Tolerance, judge_deltas
 from pixel_mcp.normalize import normalize_spec_for_viewport
 from pixel_mcp.render import (
+    BoundingBox,
     ChromiumNotInstalledError,
     MeasuredDOM,
     PlaywrightNotInstalledError,
     RenderError,
     RouteUnreachableError,
     WaitForTimeoutError,
+    capture_screenshot,
     measure_render,
 )
 from pixel_mcp.spec import DesignSpec, UnsupportedNodeTypeError, extract_spec
@@ -140,14 +142,89 @@ def run(
         deltas, tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking)
     )
 
+    # --- 4) Level 0 visual signals: SSIM + Hot Regions ---
+    ssim_score, hot_regions, visual_error = _compute_visual_signals(
+        figma_url=figma_url, route=route, viewport=viewport, wait_for=wait_for
+    )
+
+    # Combined Level 0 Gate Pass: structured Deltas AND visual signals must hold.
+    # Visual signal is best-effort — if it couldn't be computed (visual_error
+    # set), we don't block on it. When it IS available, it gates strictly.
+    if visual_error is not None:
+        visual_passes = True  # informational fallback
+    else:
+        ssim_ok = ssim_score is None or ssim_score >= SSIM_THRESHOLD
+        regions_ok = not any(r.w * r.h >= MIN_BBOX_AREA for r in hot_regions)
+        visual_passes = ssim_ok and regions_ok
+    overall_converged = judgment.converged and visual_passes
+
     envelope = _success_envelope(
         spec=spec,
         dom=dom,
         deltas=deltas,
         judgment_data=json.loads(judgment.model_dump_json()),
         truncated=truncated,
+        ssim_score=ssim_score,
+        hot_regions=hot_regions,
+        visual_error=visual_error,
+        overall_converged=overall_converged,
     )
-    return envelope, (EXIT_CONVERGED if judgment.converged else EXIT_DELTAS)
+    return envelope, (EXIT_CONVERGED if overall_converged else EXIT_DELTAS)
+
+
+# --- Level 0 visual signals (SSIM + Hot Regions) -------------------------
+
+SSIM_THRESHOLD = 0.97
+"""Default SSIM Gate Pass threshold (per PRD/CONTEXT)."""
+
+MIN_BBOX_AREA = 100
+"""Default minimum Hot Region area in px² (filters anti-aliasing noise)."""
+
+
+def _compute_visual_signals(
+    *, figma_url: str, route: str, viewport: tuple[int, int], wait_for: str | None
+) -> tuple[float | None, list[BoundingBox], str | None]:
+    """Best-effort visual diff. Returns ``(ssim, hot_regions, error_message)``.
+
+    A non-None ``error_message`` means the visual signal could not be computed
+    (e.g. Figma did not return a PNG, OpenCV failed to align images). When
+    that happens, the caller treats the visual signal as "missing" — Gate
+    Pass falls back to the structured Deltas verdict and emits a hint.
+    """
+    try:
+        # Lazy imports — keep cv2/skimage out of the critical path when
+        # visual signals are not configured.
+        import io  # noqa: PLC0415
+
+        import numpy as np  # noqa: PLC0415
+        from PIL import Image  # noqa: PLC0415
+
+        from pixel_mcp.figma_client import FigmaClient  # noqa: PLC0415
+        from pixel_mcp.figma_url import parse_figma_url  # noqa: PLC0415
+        from pixel_mcp.hot_regions import (  # noqa: PLC0415
+            compute_hot_regions,
+            compute_ssim,
+        )
+
+        parsed = parse_figma_url(figma_url)
+        with FigmaClient() as client:
+            expected_png = client.fetch_node_png_bytes(parsed.file_id, parsed.node_id)
+        actual_png = capture_screenshot(route=route, viewport=viewport, wait_for=wait_for)
+
+        expected_img = np.array(Image.open(io.BytesIO(expected_png)).convert("RGB"))
+        actual_img = np.array(Image.open(io.BytesIO(actual_png)).convert("RGB"))
+
+        ssim = compute_ssim(expected_img, actual_img)
+        regions = compute_hot_regions(
+            expected_img,
+            actual_img,
+            min_bbox_area=MIN_BBOX_AREA,
+        )
+        return ssim, regions, None
+    except Exception as exc:  # noqa: BLE001
+        # Visual signal is best-effort. Any failure → Gate Pass falls back
+        # to the structured-Delta verdict, and the envelope explains why.
+        return None, [], str(exc)
 
 
 def _success_envelope(
@@ -157,23 +234,48 @@ def _success_envelope(
     deltas: list[Delta],
     judgment_data: dict[str, Any],
     truncated: bool,
+    ssim_score: float | None = None,
+    hot_regions: list[BoundingBox] | None = None,
+    visual_error: str | None = None,
+    overall_converged: bool | None = None,
 ) -> Envelope:
     delta_dicts = [json.loads(d.model_dump_json()) for d in deltas]
+    hot_regions = hot_regions or []
+    significant_regions = [r for r in hot_regions if r.w * r.h >= MIN_BBOX_AREA]
     data: dict[str, Any] = {
-        "converged": judgment_data["converged"],
+        "converged": overall_converged
+        if overall_converged is not None
+        else judgment_data["converged"],
         "level_reached": 0,
         "summary": judgment_data["summary"],
         "judgment": judgment_data,
         "deltas": delta_dicts,
-        # Reserved fields for later slices — keep the schema shape stable.
-        "ssim_score": None,
-        "hot_regions": [],
+        "ssim_score": ssim_score,
+        "ssim_threshold": SSIM_THRESHOLD,
+        "hot_regions": [json.loads(r.model_dump_json()) for r in hot_regions],
+        "significant_hot_region_count": len(significant_regions),
+        "visual_error": visual_error,
         "spec_node_id": spec.figma_node_id,
         "dom_route": dom.route,
         "dom_element_count": len(dom.elements),
     }
 
     hints: list[str] = _build_hints(judgment_data, deltas, truncated)
+    if ssim_score is not None and ssim_score < SSIM_THRESHOLD:
+        hints.append(
+            f"SSIM Score {ssim_score:.3f} below threshold {SSIM_THRESHOLD} — "
+            "global structural drift detected (likely a layout-level mismatch)."
+        )
+    if significant_regions:
+        hints.append(
+            f"{len(significant_regions)} Hot Region(s) above {MIN_BBOX_AREA}px² — "
+            "see data.hot_regions for bboxes."
+        )
+    if visual_error is not None:
+        hints.append(
+            f"Visual signal unavailable ({visual_error[:120]}). "
+            "Level 0 Gate Pass fell back to structured Deltas only."
+        )
 
     next_action = (
         "Promote to Level 1 (DINOv2 per-crop similarity) once that plugin is enabled."

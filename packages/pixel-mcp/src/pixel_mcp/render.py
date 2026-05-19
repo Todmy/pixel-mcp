@@ -457,6 +457,88 @@ def measure_render(
     return dom, truncated
 
 
+def capture_screenshot(
+    route: str,
+    viewport: tuple[int, int] = (1280, 720),
+    wait_for: str | None = None,
+    full_page: bool = True,
+    timeout_ms: int = 15_000,
+) -> bytes:
+    """Capture a PNG screenshot of ``route`` at ``viewport`` using Playwright.
+
+    Pure adjacency to :func:`measure_render` — same dependency chain, same
+    error hierarchy. Returns raw PNG bytes; the caller decides how to persist
+    them.
+    """
+    try:
+        from playwright.sync_api import (  # noqa: PLC0415
+            Error as PlaywrightError,
+        )
+        from playwright.sync_api import (
+            TimeoutError as PlaywrightTimeoutError,
+        )
+        from playwright.sync_api import (
+            sync_playwright,
+        )
+    except ImportError as exc:
+        raise PlaywrightNotInstalledError(
+            "playwright is not installed. Run `uv sync` then "
+            "`uv run playwright install chromium`."
+        ) from exc
+
+    try:
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.launch(headless=True)
+            except PlaywrightError as exc:
+                msg = str(exc).lower()
+                if "executable doesn" in msg or "browsertype.launch" in msg:
+                    raise ChromiumNotInstalledError(
+                        "Chromium browser binary not found. Run "
+                        "`uv run playwright install chromium` (one-time, ~150MB)."
+                    ) from exc
+                raise RouteUnreachableError(f"Failed to launch Chromium: {exc}") from exc
+
+            try:
+                context = browser.new_context(
+                    viewport={"width": viewport[0], "height": viewport[1]}
+                )
+                page = context.new_page()
+                try:
+                    page.goto(route, timeout=timeout_ms)
+                except PlaywrightTimeoutError as exc:
+                    raise RouteUnreachableError(
+                        f"Navigation to {route!r} timed out after {timeout_ms}ms."
+                    ) from exc
+                except PlaywrightError as exc:
+                    raise RouteUnreachableError(f"Failed to navigate to {route!r}: {exc}") from exc
+
+                if wait_for:
+                    try:
+                        page.wait_for_selector(wait_for, timeout=timeout_ms)
+                    except PlaywrightTimeoutError as exc:
+                        raise WaitForTimeoutError(
+                            f"Selector {wait_for!r} did not appear within "
+                            f"{timeout_ms}ms on {route!r}."
+                        ) from exc
+
+                try:
+                    page.wait_for_load_state("networkidle", timeout=timeout_ms)
+                except PlaywrightTimeoutError:
+                    pass
+                page.evaluate("() => new Promise(r => requestAnimationFrame(() => r(null)))")
+
+                png_bytes: bytes = page.screenshot(full_page=full_page)
+            finally:
+                browser.close()
+    except RenderError:
+        raise
+    except Exception as exc:
+        raise RouteUnreachableError(f"Unexpected screenshot error: {exc}") from exc
+
+    return png_bytes
+
+
 __all__ = [
     "MAX_ELEMENTS",
     "MIN_AREA_PX2",
@@ -469,5 +551,6 @@ __all__ = [
     "RenderError",
     "RouteUnreachableError",
     "WaitForTimeoutError",
+    "capture_screenshot",
     "measure_render",
 ]

@@ -99,6 +99,35 @@ class FigmaClient:
         """
         return self.fetch_node(file_id, component_id)
 
+    def fetch_node_png_bytes(self, file_id: str, node_id: str, *, scale: float = 1.0) -> bytes:
+        """Render the node as PNG via the Figma ``/v1/images`` endpoint.
+
+        Returns the raw PNG bytes. Two-step: first ask Figma for an S3 URL,
+        then download. Raises the same error hierarchy as ``fetch_node``.
+        """
+        # Step 1: request render
+        response = self._request_get(
+            f"/v1/images/{file_id}",
+            params={"ids": node_id, "format": "png", "scale": str(scale)},
+        )
+        body = response.json()
+        images = body.get("images") or {}
+        url = images.get(node_id)
+        if not url:
+            raise FigmaNotFoundError(
+                f"Figma /images returned no URL for node {node_id!r} in file {file_id!r}."
+            )
+
+        # Step 2: download the S3 URL (uses a fresh client — different host)
+        try:
+            with httpx.Client(timeout=self._client.timeout) as fresh:
+                dl = fresh.get(url)
+        except httpx.HTTPError as exc:
+            raise FigmaApiError(f"Figma image download failed: {exc}") from exc
+        if dl.status_code != 200:
+            raise FigmaApiError(f"Figma image S3 download returned {dl.status_code} for {url}")
+        return dl.content
+
     def _request_get(self, path: str, params: dict[str, str]) -> httpx.Response:
         try:
             response = self._client.get(path, params=params)
