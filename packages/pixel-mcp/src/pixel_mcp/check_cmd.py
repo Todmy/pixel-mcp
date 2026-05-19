@@ -28,6 +28,7 @@ from pixel_mcp.delta import Delta, diff_design_vs_render
 from pixel_mcp.figma_client import FigmaApiError, FigmaAuthError, FigmaError, FigmaNotFoundError
 from pixel_mcp.figma_url import FigmaUrlError
 from pixel_mcp.judge import Tolerance, judge_deltas
+from pixel_mcp.normalize import normalize_spec_for_viewport
 from pixel_mcp.render import (
     ChromiumNotInstalledError,
     MeasuredDOM,
@@ -132,8 +133,9 @@ def run(
             ["See `pixel-mcp doctor` for environment diagnostics."],
         ), EXIT_FATAL
 
-    # --- 3) Diff + Judge ---
-    deltas = diff_design_vs_render(spec, dom)
+    # --- 3) Normalize spec for viewport, then Diff + Judge ---
+    normalized_spec = normalize_spec_for_viewport(spec, dom.viewport)
+    deltas = diff_design_vs_render(normalized_spec, dom)
     judgment = judge_deltas(
         deltas, tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking)
     )
