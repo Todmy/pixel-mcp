@@ -295,6 +295,22 @@ def check(
         "--dinov2-threshold",
         help="Cosine-similarity threshold for Level 1 Gate Pass (default 0.95).",
     ),
+    enable_vlm: bool = typer.Option(  # noqa: B008
+        False,
+        "--enable-vlm/--no-enable-vlm",
+        help="Opt in to Level 2 (VLM verification) escalation gate. "
+        "Runs only after Level 1 passes. Requires `pixel-mcp-ml --extra vlm`.",
+    ),
+    vlm_threshold: float = typer.Option(  # noqa: B008
+        0.7,
+        "--vlm-threshold",
+        help="Confidence threshold for Level 2 Gate Pass (default 0.7).",
+    ),
+    vlm_backend: str = typer.Option(  # noqa: B008
+        "claude",
+        "--vlm-backend",
+        help="VLM backend: 'claude' (default) or 'qwen-local' (v1-2 STUB).",
+    ),
     out: Optional[Path] = typer.Option(  # noqa: B008, UP007
         None,
         "--out",
@@ -318,6 +334,9 @@ def check(
         treat_minor_as_blocking=strict,
         enable_dinov2=enable_dinov2,
         dinov2_threshold=dinov2_threshold,
+        enable_vlm=enable_vlm,
+        vlm_threshold=vlm_threshold,
+        vlm_backend=vlm_backend,
     )
     _emit(envelope, out)
     raise typer.Exit(code=exit_code)

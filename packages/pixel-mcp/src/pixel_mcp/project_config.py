@@ -10,6 +10,7 @@ CLI flags > config file > built-in defaults (precedence).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -57,6 +58,9 @@ class ProjectConfig(BaseModel):
     min_bbox_area: int = 100
     enable_dinov2: bool = False
     dinov2_threshold: float = 0.95
+    enable_vlm: bool = False
+    vlm_threshold: float = 0.7
+    vlm_backend: Literal["claude", "qwen-local"] = "claude"
     viewport: ViewportConfig = Field(default_factory=ViewportConfig)
     mask_regions: list[MaskRegion] = Field(default_factory=list)
     figma_token_env: str = "FIGMA_TOKEN"

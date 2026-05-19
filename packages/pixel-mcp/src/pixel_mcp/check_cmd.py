@@ -92,6 +92,9 @@ def run(
     image_path: str | Path | None = None,
     enable_dinov2: bool = False,
     dinov2_threshold: float = 0.95,
+    enable_vlm: bool = False,
+    vlm_threshold: float = 0.7,
+    vlm_backend: str = "claude",
 ) -> tuple[Envelope, int]:
     """Run one Iteration of the Convergence Loop.
 
@@ -335,6 +338,38 @@ def run(
                 tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking),
             )
 
+    # --- 4d) Level 2 (VLM) gate, opt-in ---
+    # Promotes a Level 1 Gate Pass to Level 2 by asking a vision-language
+    # model to verbally judge each residual crop pair. Only runs when:
+    #   - --enable-vlm is set,
+    #   - Level 1 actually passed (level_reached == 1 AND overall_converged),
+    # so we never call the VLM on crops the cheaper gates already rejected.
+    # On any failure (no_match / ambiguous / confidence below threshold)
+    # we emit pseudo-Deltas, revert overall_converged, and keep
+    # level_reached at 1 — the next promotion target stays Level 2.
+    vlm_judgments: list[dict[str, Any]] | None = None
+    vlm_hint: str | None = None
+    if enable_vlm and overall_converged and level_reached >= 1:
+        vlm_result = _run_vlm_gate(
+            regions=regions,
+            vlm_threshold=vlm_threshold,
+            vlm_backend=vlm_backend,
+        )
+        vlm_judgments = vlm_result["judgments"]
+        vlm_hint = vlm_result["hint"]
+        failing_vlm = vlm_result["failing_deltas"]
+        if vlm_result["promoted"]:
+            level_reached = 2
+        if failing_vlm:
+            overall_converged = False
+            # Stay at Level 1 — Level 1 already passed, just couldn't get to Level 2.
+            level_reached = 1
+            deltas = list(deltas) + failing_vlm
+            judgment = judge_deltas(
+                deltas,
+                tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking),
+            )
+
     # --- 5) Loop economics: stuck detection + regression + state update ---
     current_hash = hash_deltas_bucketed(deltas)
     is_stuck = detect_stuck(state.recent_hashes, current_hash, threshold=stuck_threshold)
@@ -383,6 +418,11 @@ def run(
         dinov2_threshold=dinov2_threshold if enable_dinov2 else None,
         dinov2_similarities=dinov2_similarities,
         dinov2_hint=dinov2_hint,
+        vlm_enabled=enable_vlm,
+        vlm_threshold=vlm_threshold if enable_vlm else None,
+        vlm_backend=vlm_backend if enable_vlm else None,
+        vlm_judgments=vlm_judgments,
+        vlm_hint=vlm_hint,
     )
 
     if is_regression:
@@ -636,6 +676,170 @@ def _run_dinov2_gate(
     }
 
 
+# --- Level 2 (VLM) gate -------------------------------------------------
+
+
+def _vlm_severity_for_gap(gap: float) -> str:
+    """Map VLM confidence-gap to Delta severity.
+
+    Per PRD #10 acceptance (Level 2): gap >= 0.3 critical, >= 0.1 major,
+    else minor. ``gap`` is ``threshold - confidence`` for failures and
+    ``1.0`` for an outright ``no_match`` verdict (full disagreement).
+    """
+    if gap >= 0.3:
+        return "critical"
+    if gap >= 0.1:
+        return "major"
+    return "minor"
+
+
+def _run_vlm_gate(
+    *,
+    regions: list[Any],
+    vlm_threshold: float,
+    vlm_backend: str,
+) -> dict[str, Any]:
+    """Run Level 2 (VLM) on residual crops the Level 1 gate let through.
+
+    Same shape as :func:`_run_dinov2_gate`:
+
+    - ``judgments`` — per-region records ``{region_index, selector,
+      verdict, confidence, reasoning}``.
+    - ``failing_deltas`` — pseudo-Deltas for crops the VLM rejected.
+    - ``promoted`` — True iff at least one crop was scored AND every
+      verdict was ``match`` AND every confidence >= ``vlm_threshold``.
+    - ``hint`` — optional AXI hint (graceful fallback notice).
+
+    Lazy import: ``pixel_mcp_ml`` is only resolved here so the check
+    pipeline keeps working when the VLM extras are not installed. A
+    missing SDK surfaces as a graceful fallback hint, not a crash.
+    """
+    eligible: list[tuple[int, Path, Path, str | None]] = []
+    for idx, region in enumerate(regions):
+        exp = getattr(region, "expected_crop_path", None)
+        act = getattr(region, "actual_crop_path", None)
+        if exp and act:
+            eligible.append(
+                (
+                    idx,
+                    Path(exp),
+                    Path(act),
+                    getattr(region, "leaf_selector", None),
+                )
+            )
+
+    if not eligible:
+        return {
+            "judgments": [],
+            "failing_deltas": [],
+            "promoted": False,
+            "hint": None,
+        }
+
+    try:
+        from pixel_mcp_ml import (  # noqa: PLC0415
+            VLMNotInstalledError,
+            compute_vlm_judgment_batch,
+        )
+    except ImportError:
+        return {
+            "judgments": [],
+            "failing_deltas": [],
+            "promoted": False,
+            "hint": (
+                "Level 2 enabled but `pixel-mcp-ml --extra vlm` not installed — "
+                "falling back to Level 1 verdict. "
+                "Install: `uv tool install pixel-mcp-ml --extra vlm`."
+            ),
+        }
+
+    pairs = [(exp, act) for _idx, exp, act, _sel in eligible]
+    try:
+        verdicts = compute_vlm_judgment_batch(pairs, backend=vlm_backend)  # type: ignore[arg-type]
+    except VLMNotInstalledError:
+        return {
+            "judgments": [],
+            "failing_deltas": [],
+            "promoted": False,
+            "hint": (
+                "Level 2 enabled but vlm extras missing — "
+                "falling back to Level 1 verdict. "
+                "Install: `uv tool install pixel-mcp-ml --extra vlm`."
+            ),
+        }
+    except NotImplementedError as exc:
+        return {
+            "judgments": [],
+            "failing_deltas": [],
+            "promoted": False,
+            "hint": (
+                f"Level 2 backend {vlm_backend!r} not implemented yet "
+                f"({exc!s}). Falling back to Level 1 verdict."
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "judgments": [],
+            "failing_deltas": [],
+            "promoted": False,
+            "hint": (
+                f"Level 2 (VLM) failed at runtime ({exc!s}). " "Falling back to Level 1 verdict."
+            ),
+        }
+
+    judgments_out: list[dict[str, Any]] = []
+    failing_deltas: list[Delta] = []
+    for (region_idx, _exp, _act, selector), judgment in zip(eligible, verdicts, strict=True):
+        judgments_out.append(
+            {
+                "region_index": region_idx,
+                "selector": selector,
+                "verdict": judgment.verdict,
+                "confidence": float(judgment.confidence),
+                "reasoning": judgment.reasoning,
+            }
+        )
+        is_match = judgment.verdict == "match"
+        confident = float(judgment.confidence) >= vlm_threshold
+        if is_match and confident:
+            continue
+        # Failure: synthesise a pseudo-Delta. Gap = 1.0 when the verdict
+        # itself disagrees (no_match), else the confidence shortfall.
+        if not is_match:
+            gap = (
+                1.0
+                if judgment.verdict == "no_match"
+                else max(0.1, vlm_threshold - float(judgment.confidence))
+            )
+        else:
+            gap = max(0.0, vlm_threshold - float(judgment.confidence))
+        severity = _vlm_severity_for_gap(gap)
+        failing_deltas.append(
+            Delta(
+                selector=selector or f"vlm_region_{region_idx}",
+                figma_node_id=None,
+                property=f"vlm_verdict_{region_idx}",
+                observed={
+                    "verdict": judgment.verdict,
+                    "confidence": float(judgment.confidence),
+                    "threshold": vlm_threshold,
+                    "reasoning": judgment.reasoning,
+                },
+                expected={"verdict": "match", "confidence_gte": vlm_threshold},
+                magnitude=gap,
+                severity=severity,  # type: ignore[arg-type]
+            )
+        )
+
+    promoted = not failing_deltas
+    return {
+        "judgments": judgments_out,
+        "failing_deltas": failing_deltas,
+        "promoted": promoted,
+        "hint": None,
+    }
+
+
 def _success_envelope(
     *,
     spec: DesignSpec | None,
@@ -659,6 +863,11 @@ def _success_envelope(
     dinov2_threshold: float | None = None,
     dinov2_similarities: list[dict[str, Any]] | None = None,
     dinov2_hint: str | None = None,
+    vlm_enabled: bool = False,
+    vlm_threshold: float | None = None,
+    vlm_backend: str | None = None,
+    vlm_judgments: list[dict[str, Any]] | None = None,
+    vlm_hint: str | None = None,
 ) -> Envelope:
     delta_dicts = [json.loads(d.model_dump_json()) for d in deltas]
     hot_regions = hot_regions or []
@@ -690,6 +899,10 @@ def _success_envelope(
         "dinov2_enabled": dinov2_enabled,
         "dinov2_threshold": dinov2_threshold,
         "dinov2_similarities": dinov2_similarities,
+        "vlm_enabled": vlm_enabled,
+        "vlm_threshold": vlm_threshold,
+        "vlm_backend": vlm_backend,
+        "vlm_judgments": vlm_judgments,
     }
 
     hints: list[str] = _build_hints(judgment_data, deltas, truncated, mode=mode)
@@ -741,6 +954,24 @@ def _success_envelope(
                 f"Level 1 (DINOv2) Gate Pass: {len(dinov2_similarities)} crop(s) "
                 f"above similarity threshold {dinov2_threshold}."
             )
+    if vlm_hint is not None:
+        hints.append(vlm_hint)
+    if vlm_enabled and vlm_judgments:
+        failing_vlm = [
+            v
+            for v in vlm_judgments
+            if v["verdict"] != "match" or v["confidence"] < (vlm_threshold or 0)
+        ]
+        if failing_vlm:
+            hints.append(
+                f"Level 2 (VLM) failed on {len(failing_vlm)} crop(s) — "
+                "see data.vlm_judgments for verdicts and reasoning."
+            )
+        elif level_reached >= 2:
+            hints.append(
+                f"Level 2 (VLM) Gate Pass: {len(vlm_judgments)} crop(s) "
+                f"judged 'match' above confidence threshold {vlm_threshold}."
+            )
 
     converged_now = (
         overall_converged if overall_converged is not None else judgment_data["converged"]
@@ -749,8 +980,15 @@ def _success_envelope(
         next_action = (
             "Have the Agent fix the listed Deltas, then re-invoke `mcp__pixel_mcp__check`."
         )
+    elif level_reached >= 2:
+        next_action = (
+            "Level 2 Gate Pass. Level 3 (human review) is the next escalation tier (v1-3+)."
+        )
     elif level_reached >= 1:
-        next_action = "Level 1 Gate Pass. Promote to Level 2 (VLM) once that plugin is enabled."
+        next_action = (
+            "Level 1 Gate Pass. Promote to Level 2 (VLM) by re-running "
+            "`pixel-mcp check --enable-vlm`."
+        )
     else:
         next_action = (
             "Promote to Level 1 (DINOv2 per-crop similarity) by re-running "

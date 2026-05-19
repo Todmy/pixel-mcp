@@ -36,6 +36,7 @@ def test_doctor_envelope_includes_python_check() -> None:
         "httpx",
         "figma_api_reachable",
         "pixel_mcp_ml",
+        "pixel_mcp_ml_vlm",
         "uv",
     } <= names
 
@@ -145,6 +146,85 @@ def test_pixel_mcp_ml_check_red_when_package_missing(
     monkeypatch.setattr(importlib.util, "find_spec", fake_find)
     result = doctor_mod._check_pixel_mcp_ml()
     assert result["status"] == "red"
+
+
+def test_pixel_mcp_ml_vlm_check_green_when_anthropic_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Package found AND anthropic importable -> green for the VLM extra."""
+    import importlib.util
+
+    real_find = importlib.util.find_spec
+
+    def fake_find(name: str, *args: object, **kwargs: object) -> object:
+        if name in ("pixel_mcp_ml", "anthropic"):
+            return object()
+        return real_find(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find)
+    result = doctor_mod._check_pixel_mcp_ml_vlm()
+    assert result["status"] == "green"
+
+
+def test_pixel_mcp_ml_vlm_check_amber_when_anthropic_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Package present, anthropic missing -> amber + name in detail."""
+    import importlib.util
+
+    real_find = importlib.util.find_spec
+
+    def fake_find(name: str, *args: object, **kwargs: object) -> object:
+        if name == "pixel_mcp_ml":
+            return object()
+        if name == "anthropic":
+            return None
+        return real_find(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find)
+    result = doctor_mod._check_pixel_mcp_ml_vlm()
+    assert result["status"] == "amber"
+    assert "anthropic" in result["detail"]
+
+
+def test_pixel_mcp_ml_vlm_check_red_when_package_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Package absent -> red for the VLM extra too."""
+    import importlib.util
+
+    real_find = importlib.util.find_spec
+
+    def fake_find(name: str, *args: object, **kwargs: object) -> object:
+        if name == "pixel_mcp_ml":
+            return None
+        return real_find(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find)
+    result = doctor_mod._check_pixel_mcp_ml_vlm()
+    assert result["status"] == "red"
+
+
+def test_pixel_mcp_ml_extras_are_independent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dinov2 extra and the vlm extra report independently.
+
+    Scenario: package present, transformers/torch present (dinov2 green),
+    anthropic absent (vlm amber). Both rows must reflect the truth.
+    """
+    import importlib.util
+
+    real_find = importlib.util.find_spec
+
+    def fake_find(name: str, *args: object, **kwargs: object) -> object:
+        if name in ("pixel_mcp_ml", "transformers", "torch"):
+            return object()
+        if name == "anthropic":
+            return None
+        return real_find(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find)
+    assert doctor_mod._check_pixel_mcp_ml()["status"] == "green"
+    assert doctor_mod._check_pixel_mcp_ml_vlm()["status"] == "amber"
 
 
 def test_no_stub_subcommands_remain(runner: CliRunner) -> None:

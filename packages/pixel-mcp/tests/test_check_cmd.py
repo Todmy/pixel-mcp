@@ -583,3 +583,243 @@ def test_dinov2_gate_scores_persisted_crops(
 
     assert exit_code == EXIT_CONVERGED
     assert envelope["data"]["level_reached"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Level 2 (VLM) gate — v1-1
+# ---------------------------------------------------------------------------
+
+
+def _vlm_judgment_obj(
+    verdict: str = "match", confidence: float = 0.9, reasoning: str = "ok"
+) -> Any:
+    """Return an object compatible with VLMJudgment (verdict/confidence/reasoning)."""
+    from pixel_mcp_ml.vlm_verify import VLMJudgment
+
+    return VLMJudgment(
+        verdict=verdict,  # type: ignore[arg-type]
+        confidence=confidence,
+        reasoning=reasoning,
+    )
+
+
+def test_vlm_gate_skipped_when_disabled(mocked_pipeline: Any, tmp_path: Path) -> None:
+    """No VLM import attempted when --enable-vlm is off (default)."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path)
+
+    with (
+        _patch_visual_signals(regions),
+        patch("pixel_mcp.check_cmd._run_vlm_gate") as m_gate,
+    ):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+        )
+
+    assert exit_code == EXIT_CONVERGED
+    assert m_gate.call_count == 0
+    assert envelope["data"]["vlm_enabled"] is False
+    assert envelope["data"]["vlm_threshold"] is None
+    assert envelope["data"]["vlm_backend"] is None
+    assert envelope["data"]["vlm_judgments"] is None
+
+
+def test_vlm_gate_runs_after_level1_pass(mocked_pipeline: Any, tmp_path: Path) -> None:
+    """When --enable-dinov2 + --enable-vlm and Level 1 passes, Level 2 promotes."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=2)
+
+    fake_dinov2 = MagicMock(return_value=[0.99, 0.98])
+    fake_vlm = MagicMock(
+        return_value=[
+            _vlm_judgment_obj(verdict="match", confidence=0.92, reasoning="ok 1"),
+            _vlm_judgment_obj(verdict="match", confidence=0.85, reasoning="ok 2"),
+        ]
+    )
+    fake_pkg = types.ModuleType("pixel_mcp_ml")
+    fake_pkg.compute_dinov2_similarity_batch = fake_dinov2  # type: ignore[attr-defined]
+    fake_pkg.compute_vlm_judgment_batch = fake_vlm  # type: ignore[attr-defined]
+
+    # Real VLMNotInstalledError class so the gate's `except VLMNotInstalledError`
+    # statement keeps working when the fake package is in sys.modules.
+    from pixel_mcp_ml.vlm_verify import VLMNotInstalledError
+
+    fake_pkg.VLMNotInstalledError = VLMNotInstalledError  # type: ignore[attr-defined]
+
+    with (
+        _patch_visual_signals(regions),
+        patch.dict(sys.modules, {"pixel_mcp_ml": fake_pkg}),
+    ):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_dinov2=True,
+            enable_vlm=True,
+        )
+
+    assert exit_code == EXIT_CONVERGED
+    assert envelope["data"]["converged"] is True
+    assert envelope["data"]["level_reached"] == 2
+    assert envelope["data"]["vlm_enabled"] is True
+    assert envelope["data"]["vlm_threshold"] == pytest.approx(0.7)
+    assert envelope["data"]["vlm_backend"] == "claude"
+    judgments = envelope["data"]["vlm_judgments"]
+    assert isinstance(judgments, list) and len(judgments) == 2
+    assert all(j["verdict"] == "match" for j in judgments)
+
+
+def test_vlm_gate_fails_with_no_match(mocked_pipeline: Any, tmp_path: Path) -> None:
+    """Any ``no_match`` verdict → pseudo-Delta + level_reached stays at 1."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=2)
+
+    fake_dinov2 = MagicMock(return_value=[0.99, 0.98])
+    fake_vlm = MagicMock(
+        return_value=[
+            _vlm_judgment_obj(verdict="no_match", confidence=0.95, reasoning="different colour"),
+            _vlm_judgment_obj(verdict="match", confidence=0.9, reasoning="ok"),
+        ]
+    )
+    fake_pkg = types.ModuleType("pixel_mcp_ml")
+    fake_pkg.compute_dinov2_similarity_batch = fake_dinov2  # type: ignore[attr-defined]
+    fake_pkg.compute_vlm_judgment_batch = fake_vlm  # type: ignore[attr-defined]
+    from pixel_mcp_ml.vlm_verify import VLMNotInstalledError
+
+    fake_pkg.VLMNotInstalledError = VLMNotInstalledError  # type: ignore[attr-defined]
+
+    with (
+        _patch_visual_signals(regions),
+        patch.dict(sys.modules, {"pixel_mcp_ml": fake_pkg}),
+    ):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_dinov2=True,
+            enable_vlm=True,
+        )
+
+    assert exit_code == EXIT_DELTAS
+    assert envelope["data"]["converged"] is False
+    assert envelope["data"]["level_reached"] == 1  # Level 1 passed, Level 2 didn't
+    vlm_deltas = [d for d in envelope["data"]["deltas"] if d["property"].startswith("vlm_verdict_")]
+    assert len(vlm_deltas) == 1
+    assert vlm_deltas[0]["severity"] == "critical"  # gap 1.0 → critical
+
+
+def test_vlm_gate_fails_when_confidence_below_threshold(
+    mocked_pipeline: Any, tmp_path: Path
+) -> None:
+    """``match`` verdict with low confidence → pseudo-Delta."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=1)
+
+    fake_dinov2 = MagicMock(return_value=[0.99])
+    fake_vlm = MagicMock(
+        return_value=[_vlm_judgment_obj(verdict="match", confidence=0.3, reasoning="unsure")]
+    )
+    fake_pkg = types.ModuleType("pixel_mcp_ml")
+    fake_pkg.compute_dinov2_similarity_batch = fake_dinov2  # type: ignore[attr-defined]
+    fake_pkg.compute_vlm_judgment_batch = fake_vlm  # type: ignore[attr-defined]
+    from pixel_mcp_ml.vlm_verify import VLMNotInstalledError
+
+    fake_pkg.VLMNotInstalledError = VLMNotInstalledError  # type: ignore[attr-defined]
+
+    with (
+        _patch_visual_signals(regions),
+        patch.dict(sys.modules, {"pixel_mcp_ml": fake_pkg}),
+    ):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_dinov2=True,
+            enable_vlm=True,
+            vlm_threshold=0.7,
+        )
+
+    assert exit_code == EXIT_DELTAS
+    assert envelope["data"]["converged"] is False
+    assert envelope["data"]["level_reached"] == 1
+    vlm_deltas = [d for d in envelope["data"]["deltas"] if d["property"].startswith("vlm_verdict_")]
+    assert len(vlm_deltas) == 1
+    # gap = 0.7 - 0.3 = 0.4 → critical
+    assert vlm_deltas[0]["severity"] == "critical"
+
+
+def test_vlm_gate_graceful_fallback_when_extras_missing(
+    mocked_pipeline: Any, tmp_path: Path
+) -> None:
+    """Level 2 hint surfaces, Level 1 verdict stands, no crash."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=1)
+
+    # Provide a DINOv2 path through pixel_mcp_ml but NO VLM symbols.
+    fake_dinov2 = MagicMock(return_value=[0.99])
+    fake_pkg = types.ModuleType("pixel_mcp_ml")
+    fake_pkg.compute_dinov2_similarity_batch = fake_dinov2  # type: ignore[attr-defined]
+
+    # Make `from pixel_mcp_ml import compute_vlm_judgment_batch, VLMNotInstalledError`
+    # raise ImportError by deleting those attributes — Python's ``from`` lookup
+    # on a module without the name raises ImportError, mirroring the missing-extra
+    # path the gate guards against.
+
+    with (
+        _patch_visual_signals(regions),
+        patch.dict(sys.modules, {"pixel_mcp_ml": fake_pkg}),
+    ):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_dinov2=True,
+            enable_vlm=True,
+        )
+
+    assert exit_code == EXIT_CONVERGED
+    assert envelope["data"]["converged"] is True
+    # Level 1 stands; Level 2 did NOT promote.
+    assert envelope["data"]["level_reached"] == 1
+    hints_text = " ".join(envelope["hints"])
+    assert "Level 2" in hints_text
+    assert "vlm" in hints_text.lower()
+
+
+def test_vlm_gate_not_run_when_level1_fails(mocked_pipeline: Any, tmp_path: Path) -> None:
+    """If Level 1 (DINOv2) failed, Level 2 must NOT execute — saves API calls."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=1)
+
+    fake_dinov2 = MagicMock(return_value=[0.5])  # below 0.95 → Level 1 fails
+    fake_vlm = MagicMock()  # should NEVER be called
+    fake_pkg = types.ModuleType("pixel_mcp_ml")
+    fake_pkg.compute_dinov2_similarity_batch = fake_dinov2  # type: ignore[attr-defined]
+    fake_pkg.compute_vlm_judgment_batch = fake_vlm  # type: ignore[attr-defined]
+    from pixel_mcp_ml.vlm_verify import VLMNotInstalledError
+
+    fake_pkg.VLMNotInstalledError = VLMNotInstalledError  # type: ignore[attr-defined]
+
+    with (
+        _patch_visual_signals(regions),
+        patch.dict(sys.modules, {"pixel_mcp_ml": fake_pkg}),
+    ):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_dinov2=True,
+            enable_vlm=True,
+        )
+
+    assert exit_code == EXIT_DELTAS
+    assert envelope["data"]["level_reached"] == 0
+    assert fake_vlm.call_count == 0  # the whole point of the test

@@ -1,7 +1,7 @@
 [project]
 name = "pixel-mcp-ml"
 version = "0.1.0"
-description = "ML extras for pixel-mcp — DINOv2 perceptual similarity (Level 1 escalation gate)."
+description = "ML extras for pixel-mcp — DINOv2 perceptual similarity (Level 1) and VLM verification (Level 2)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
@@ -17,6 +17,9 @@ dinov2 = [
     "transformers>=4.40",
     "torch>=2.0",
     "safetensors>=0.4",
+]
+vlm = [
+    "anthropic>=0.40",
 ]
 
 [project.scripts]

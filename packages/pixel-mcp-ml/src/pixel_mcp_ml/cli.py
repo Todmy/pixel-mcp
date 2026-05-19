@@ -1,13 +1,17 @@
 """Typer entry point — `pixel-mcp-ml <verb>`.
 
-Currently exposes one verb: ``dinov2-compare``. Future slices add
-``omniparser-detect`` and VLM bridges.
+Currently exposes two verbs:
+
+- ``dinov2-compare`` — Level 1 perceptual similarity.
+- ``vlm-verify`` — Level 2 vision-language model verdict.
+
+Future slices add ``omniparser-detect`` and a local Qwen backend.
 
 Exit codes:
 
 - ``0`` — Success.
 - ``1`` — One or both input images do not exist on disk.
-- ``12`` — DINOv2 deps not installed (use the install hint).
+- ``12`` — Required dependency missing OR backend not yet implemented.
 """
 
 from __future__ import annotations
@@ -24,10 +28,14 @@ from pixel_mcp_ml.dinov2_compare import (
     compute_dinov2_similarity,
 )
 from pixel_mcp_ml.version import __version__
+from pixel_mcp_ml.vlm_verify import (
+    VLMNotInstalledError,
+    compute_vlm_judgment,
+)
 
 app = typer.Typer(
     name="pixel-mcp-ml",
-    help="ML extras for pixel-mcp (DINOv2 perceptual similarity).",
+    help="ML extras for pixel-mcp (DINOv2 similarity, VLM verification).",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -109,6 +117,62 @@ def dinov2_compare(
         typer.echo(json_mod.dumps(payload))
     else:
         typer.echo(f"Similarity: {similarity:.4f}")
+
+
+@app.command("vlm-verify")
+def vlm_verify(
+    image_a: Path = typer.Argument(..., help="Expected (design) crop."),  # noqa: B008
+    image_b: Path = typer.Argument(..., help="Actual (rendered) crop."),  # noqa: B008
+    backend: str = typer.Option(  # noqa: B008
+        "claude",
+        "--backend",
+        help="VLM backend: 'claude' (default) or 'qwen-local' (v1-2).",
+    ),
+    model: str | None = typer.Option(  # noqa: B008
+        None,
+        "--model",
+        help="Override the default model name for the chosen backend.",
+    ),
+    json: bool = typer.Option(  # noqa: B008
+        False,
+        "--json",
+        help="Emit JSON instead of the human-readable verdict line.",
+    ),
+) -> None:
+    """Ask a vision-language model to judge two crops (Level 2 gate)."""
+    if backend not in ("claude", "qwen-local"):
+        typer.echo(
+            f"--backend must be 'claude' or 'qwen-local'; got {backend!r}",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    for label, path in (("image_a", image_a), ("image_b", image_b)):
+        if not path.exists():
+            typer.echo(f"{label} not found: {path}", err=True)
+            raise typer.Exit(code=1)
+
+    try:
+        judgment = compute_vlm_judgment(
+            image_a,
+            image_b,
+            backend=backend,  # type: ignore[arg-type]
+            model=model,
+        )
+    except VLMNotInstalledError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=12) from exc
+    except NotImplementedError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=12) from exc
+
+    if json:
+        typer.echo(json_mod.dumps(judgment.model_dump()))
+    else:
+        typer.echo(
+            f"Verdict: {judgment.verdict} (confidence: {judgment.confidence:.2f}) "
+            f'— "{judgment.reasoning}"'
+        )
 
 
 if __name__ == "__main__":

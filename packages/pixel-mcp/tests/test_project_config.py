@@ -55,3 +55,21 @@ def test_dinov2_overrides_via_config_file(tmp_path: Path) -> None:
     cfg = load_project_config(project_root=tmp_path)
     assert cfg.enable_dinov2 is True
     assert cfg.dinov2_threshold == pytest.approx(0.9)
+
+
+def test_vlm_defaults_off() -> None:
+    """Level 2 (VLM) is opt-in — defaults to disabled, threshold 0.7, backend claude."""
+    cfg = ProjectConfig()
+    assert cfg.enable_vlm is False
+    assert cfg.vlm_threshold == pytest.approx(0.7)
+    assert cfg.vlm_backend == "claude"
+
+
+def test_vlm_overrides_via_config_file(tmp_path: Path) -> None:
+    (tmp_path / ".pixel-mcp.json").write_text(
+        '{"enable_vlm": true, "vlm_threshold": 0.85, "vlm_backend": "qwen-local"}'
+    )
+    cfg = load_project_config(project_root=tmp_path)
+    assert cfg.enable_vlm is True
+    assert cfg.vlm_threshold == pytest.approx(0.85)
+    assert cfg.vlm_backend == "qwen-local"

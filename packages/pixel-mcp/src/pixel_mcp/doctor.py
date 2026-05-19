@@ -209,6 +209,38 @@ def _check_pixel_mcp_ml() -> CheckResult:
     }
 
 
+def _check_pixel_mcp_ml_vlm() -> CheckResult:
+    """Plugin check — is the ``vlm`` extra (Level 2 VLM bridge) installed?
+
+    Tri-state, evaluated independently of the ``dinov2`` extra:
+
+    - green: package found AND ``anthropic`` SDK importable.
+    - amber: package found but ``anthropic`` missing.
+    - red:   package not found at all.
+
+    Same lazy-probe discipline as the DINOv2 check — never imports the
+    SDK, only ``find_spec``s it.
+    """
+    if importlib.util.find_spec("pixel_mcp_ml") is None:
+        return {
+            "name": "pixel_mcp_ml_vlm",
+            "status": "red",
+            "detail": "pixel-mcp-ml not installed (Level 2 VLM verification unavailable)",
+        }
+    have_anthropic = importlib.util.find_spec("anthropic") is not None
+    if have_anthropic:
+        return {
+            "name": "pixel_mcp_ml_vlm",
+            "status": "green",
+            "detail": "pixel-mcp-ml installed with anthropic (Level 2 VLM ready)",
+        }
+    return {
+        "name": "pixel_mcp_ml_vlm",
+        "status": "amber",
+        "detail": "pixel-mcp-ml installed but vlm backend missing: anthropic",
+    }
+
+
 def _check_uv() -> CheckResult:
     path = shutil.which("uv")
     if path:
@@ -233,6 +265,7 @@ def run_checks() -> list[CheckResult]:
         _check_httpx(),
         _check_figma_api_reachable(),
         _check_pixel_mcp_ml(),
+        _check_pixel_mcp_ml_vlm(),
         _check_uv(),
     ]
 
@@ -252,6 +285,11 @@ def _hints_for(checks: list[CheckResult]) -> list[str]:
             hints.append(
                 "Install pixel-mcp-ml: `uv tool install pixel-mcp-ml` "
                 "(Level 1 DINOv2 similarity gate)."
+            )
+        elif c["name"] == "pixel_mcp_ml_vlm":
+            hints.append(
+                "Install pixel-mcp-ml: `uv tool install pixel-mcp-ml` "
+                "(Level 2 VLM verification gate)."
             )
     for c in checks:
         if c["status"] != "amber":
@@ -279,6 +317,11 @@ def _hints_for(checks: list[CheckResult]) -> list[str]:
             hints.append(
                 "Install ML extras: `uv tool install pixel-mcp-ml --extra dinov2` "
                 "(adds transformers + torch for DINOv2)."
+            )
+        elif c["name"] == "pixel_mcp_ml_vlm":
+            hints.append(
+                "Install VLM extras: `uv tool install pixel-mcp-ml --extra vlm` "
+                "(adds anthropic SDK for the Claude backend)."
             )
     return hints
 

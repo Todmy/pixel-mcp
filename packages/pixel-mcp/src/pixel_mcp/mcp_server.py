@@ -151,6 +151,9 @@ def check(
     treat_minor_as_blocking: bool = False,
     enable_dinov2: bool = False,
     dinov2_threshold: float = 0.95,
+    enable_vlm: bool = False,
+    vlm_threshold: float = 0.7,
+    vlm_backend: str = "claude",
 ) -> dict[str, Any]:
     """One Iteration of the Convergence Loop.
 
@@ -175,6 +178,14 @@ def check(
             Requires ``pixel-mcp-ml --extra dinov2`` installed.
         dinov2_threshold: Cosine-similarity threshold for Level 1 Gate Pass
             (default 0.95).
+        enable_vlm: Opt in to Level 2 (VLM verification) gate. Runs only
+            after a Level 1 Gate Pass. Requires
+            ``pixel-mcp-ml --extra vlm`` installed and (for the claude
+            backend) ``ANTHROPIC_API_KEY`` in the environment.
+        vlm_threshold: Confidence threshold for Level 2 Gate Pass
+            (default 0.7).
+        vlm_backend: VLM backend — ``claude`` (default) or ``qwen-local``
+            (v1-2, currently STUB).
 
     Returns the AXI envelope wrapping ``{mode, converged, deltas, judgment, ...}``.
     """
@@ -189,6 +200,9 @@ def check(
         treat_minor_as_blocking=treat_minor_as_blocking,
         enable_dinov2=enable_dinov2,
         dinov2_threshold=dinov2_threshold,
+        enable_vlm=enable_vlm,
+        vlm_threshold=vlm_threshold,
+        vlm_backend=vlm_backend,
     )
     serialized: dict[str, Any] = json.loads(json.dumps(envelope, default=str))
     return serialized
