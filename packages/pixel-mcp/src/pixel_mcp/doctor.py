@@ -77,6 +77,50 @@ def _check_figma_token() -> CheckResult:
     }
 
 
+def _check_httpx() -> CheckResult:
+    if importlib.util.find_spec("httpx") is not None:
+        return {
+            "name": "httpx",
+            "status": "green",
+            "detail": "httpx importable (Figma REST client)",
+        }
+    return {
+        "name": "httpx",
+        "status": "red",
+        "detail": "httpx not installed — required by `pixel-mcp spec`",
+    }
+
+
+def _check_figma_api_reachable() -> CheckResult:
+    """HEAD https://api.figma.com — confirms DNS + TCP + TLS reach.
+
+    Non-fatal: a transient network blip shouldn't block the rest of doctor.
+    The check uses a short timeout so it never hangs the CLI.
+    """
+    try:
+        import httpx  # local import — doctor must still work without it
+    except ImportError:
+        return {
+            "name": "figma_api_reachable",
+            "status": "amber",
+            "detail": "Skipped — httpx not importable",
+        }
+    try:
+        response = httpx.head("https://api.figma.com", timeout=5.0)
+        # Any HTTP response (even 404 or 401) means the host is reachable.
+        return {
+            "name": "figma_api_reachable",
+            "status": "green",
+            "detail": f"api.figma.com reachable (HTTP {response.status_code})",
+        }
+    except Exception as exc:  # network unreachable, DNS fail, TLS fail, etc.
+        return {
+            "name": "figma_api_reachable",
+            "status": "amber",
+            "detail": f"api.figma.com not reachable: {exc.__class__.__name__}",
+        }
+
+
 def _check_uv() -> CheckResult:
     path = shutil.which("uv")
     if path:
@@ -97,6 +141,8 @@ def run_checks() -> list[CheckResult]:
         _check_python_version(),
         _check_playwright(),
         _check_figma_token(),
+        _check_httpx(),
+        _check_figma_api_reachable(),
         _check_uv(),
     ]
 
@@ -123,6 +169,10 @@ def _hints_for(checks: list[CheckResult]) -> list[str]:
             hints.append(
                 "Install uv from https://docs.astral.sh/uv/ to use the documented install path"
             )
+        elif c["name"] == "figma_api_reachable":
+            hints.append(
+                "Check network — api.figma.com unreachable. `pixel-mcp spec` will fail until this clears."
+            )
     return hints
 
 
@@ -131,8 +181,11 @@ def _next_action(checks: list[CheckResult]) -> str:
         red = [c["name"] for c in checks if c["status"] == "red"]
         return f"Resolve red Checks before proceeding: {', '.join(red)}"
     if any(c["status"] == "amber" for c in checks):
-        return "Amber Checks are non-fatal — proceed to issue #12 (Figma extractor)"
-    return "All green — proceed to issue #12 (Figma extractor)"
+        return (
+            "Amber Checks are non-fatal — `pixel-mcp spec` is ready when "
+            "FIGMA_TOKEN is set. Slice 3 (`measure`) needs Playwright."
+        )
+    return "All green — `pixel-mcp spec` is ready. Next slice: `measure` (issue #13)."
 
 
 def build_envelope() -> Envelope:

@@ -1,0 +1,43 @@
+{
+  "name": "Page With Instance",
+  "lastModified": "2026-05-19T10:00:00Z",
+  "nodes": {
+    "55:100": {
+      "document": {
+        "id": "55:100",
+        "name": "CardInstance",
+        "type": "INSTANCE",
+        "componentId": "10:20",
+        "absoluteBoundingBox": {"x": 100, "y": 200, "width": 320, "height": 180},
+        "layoutMode": "VERTICAL",
+        "paddingTop": 16,
+        "paddingRight": 16,
+        "paddingBottom": 16,
+        "paddingLeft": 16,
+        "itemSpacing": 12,
+        "constraints": {"horizontal": "LEFT", "vertical": "TOP"},
+        "fills": [
+          {"type": "SOLID", "color": {"r": 0.95, "g": 0.95, "b": 1.0, "a": 1.0}}
+        ],
+        "strokes": [],
+        "overrides": [
+          {
+            "id": "55:100",
+            "overriddenFields": ["fills"]
+          }
+        ],
+        "children": []
+      },
+      "components": {
+        "10:20": {
+          "key": "abc123",
+          "name": "CardMaster",
+          "description": ""
+        }
+      },
+      "componentSets": {},
+      "schemaVersion": 0,
+      "styles": {}
+    }
+  }
+}

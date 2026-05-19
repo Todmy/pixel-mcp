@@ -1,0 +1,19 @@
+{
+  "name": "Unsupported",
+  "lastModified": "2026-05-19T10:00:00Z",
+  "nodes": {
+    "99:1": {
+      "document": {
+        "id": "99:1",
+        "name": "LooseGroup",
+        "type": "GROUP",
+        "absoluteBoundingBox": {"x": 0, "y": 0, "width": 100, "height": 100},
+        "children": []
+      },
+      "components": {},
+      "componentSets": {},
+      "schemaVersion": 0,
+      "styles": {}
+    }
+  }
+}

@@ -28,7 +28,14 @@ def test_doctor_envelope_has_required_fields() -> None:
 def test_doctor_envelope_includes_python_check() -> None:
     env = doctor_mod.build_envelope()
     names = {c["name"] for c in env["data"]["checks"]}
-    assert {"python_version", "playwright", "figma_token", "uv"} <= names
+    assert {
+        "python_version",
+        "playwright",
+        "figma_token",
+        "httpx",
+        "figma_api_reachable",
+        "uv",
+    } <= names
 
 
 def test_doctor_python_check_green_on_supported_runtime() -> None:
@@ -82,6 +89,7 @@ def test_help_lists_subcommands(runner: CliRunner) -> None:
 
 
 def test_stub_subcommand_exits_nonzero(runner: CliRunner) -> None:
-    result = runner.invoke(app, ["spec"])
+    # `spec` is no longer a stub (Slice 2). Use `measure` (Slice 3, stub) instead.
+    result = runner.invoke(app, ["measure"])
     assert result.exit_code != 0
-    assert "Todmy/PBaaS#12" in (result.stderr or result.output)
+    assert "Todmy/PBaaS#13" in (result.stderr or result.output)

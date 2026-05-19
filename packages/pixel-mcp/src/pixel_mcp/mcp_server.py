@@ -13,6 +13,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from pixel_mcp import doctor as doctor_mod
+from pixel_mcp import spec_cmd as spec_cmd_mod
 
 server: FastMCP = FastMCP("pixel-mcp")
 
@@ -31,6 +32,22 @@ def doctor() -> dict[str, Any]:
     # Round-trip through JSON to guarantee plain-JSON-safe types before the
     # MCP framework serializes the response.
     serialized: dict[str, Any] = json.loads(json.dumps(envelope))
+    return serialized
+
+
+@server.tool()
+def spec(figma_url: str, refresh: bool = False) -> dict[str, Any]:
+    """Extract a DesignSpec from a Figma Source.
+
+    Args:
+        figma_url: A Figma URL — Frame, Component Instance, or Master Component.
+        refresh: Bypass the spec-cache and re-fetch from the Figma API.
+
+    Returns the AXI envelope wrapping the DesignSpec (or a diagnostic
+    envelope with ``data: null`` if extraction failed).
+    """
+    envelope, _exit_code = spec_cmd_mod.run(figma_url=figma_url, refresh=refresh)
+    serialized: dict[str, Any] = json.loads(json.dumps(envelope, default=str))
     return serialized
 
 

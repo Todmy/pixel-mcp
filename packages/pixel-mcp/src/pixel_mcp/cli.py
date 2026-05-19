@@ -1,18 +1,21 @@
 """Typer entry point — `pixel-mcp <verb>`.
 
-Slice 1 implements `doctor` and `mcp`. Every other subcommand is a stub
-that points at the tracking issue and exits non-zero.
+Slice 1 implements `doctor` and `mcp`; Slice 2 adds `spec`. Every other
+subcommand is a stub that points at the tracking issue and exits non-zero.
 """
 
 from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
+from typing import Optional
 
 import typer
 from pixel_tools_shared import Envelope
 
 from pixel_mcp import doctor as doctor_mod
+from pixel_mcp import spec_cmd as spec_cmd_mod
 from pixel_mcp.version import __version__
 
 app = typer.Typer(
@@ -92,9 +95,31 @@ def _stub(verb: str, issue: int) -> None:
 
 
 @app.command()
-def spec() -> None:
-    """Extract a DesignSpec from a Figma Source. (stub)"""
-    _stub("spec", 12)
+def spec(
+    figma: str = typer.Option(  # noqa: B008
+        ...,
+        "--figma",
+        help="Figma URL — Frame, Component Instance, or Master Component.",
+    ),
+    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+        None,
+        "--out",
+        help="Write the AXI envelope JSON to this file. Defaults to stdout.",
+    ),
+    refresh_spec: bool = typer.Option(  # noqa: B008
+        False,
+        "--refresh-spec",
+        help="Bypass the spec-cache and re-fetch from the Figma API.",
+    ),
+) -> None:
+    """Extract a DesignSpec from a Figma Source."""
+    envelope, exit_code = spec_cmd_mod.run(figma_url=figma, refresh=refresh_spec)
+    payload = json.dumps(envelope, indent=2, default=str)
+    if out is not None:
+        out.write_text(payload)
+    else:
+        typer.echo(payload)
+    raise typer.Exit(code=exit_code)
 
 
 @app.command()

@@ -590,15 +590,19 @@ name = "pixel-mcp"
 version = "0.1.0"
 source = { editable = "packages/pixel-mcp" }
 dependencies = [
+    { name = "httpx" },
     { name = "mcp" },
     { name = "pixel-tools-shared" },
+    { name = "pydantic" },
     { name = "typer" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
     { name = "mcp", specifier = ">=1.0" },
     { name = "pixel-tools-shared", editable = "packages/shared" },
+    { name = "pydantic", specifier = ">=2.6" },
     { name = "typer", specifier = ">=0.12" },
 ]
 

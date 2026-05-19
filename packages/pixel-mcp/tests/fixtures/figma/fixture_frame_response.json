@@ -1,0 +1,59 @@
+{
+  "name": "Test File",
+  "lastModified": "2026-05-19T10:00:00Z",
+  "nodes": {
+    "123:456": {
+      "document": {
+        "id": "123:456",
+        "name": "PrimaryButton",
+        "type": "FRAME",
+        "absoluteBoundingBox": {"x": 0, "y": 0, "width": 200, "height": 48},
+        "layoutMode": "HORIZONTAL",
+        "paddingTop": 12,
+        "paddingRight": 24,
+        "paddingBottom": 12,
+        "paddingLeft": 24,
+        "itemSpacing": 8,
+        "primaryAxisSizingMode": "AUTO",
+        "counterAxisSizingMode": "FIXED",
+        "layoutSizingHorizontal": "HUG",
+        "layoutSizingVertical": "FIXED",
+        "constraints": {"horizontal": "LEFT", "vertical": "TOP"},
+        "cornerRadius": 8,
+        "fills": [
+          {
+            "type": "SOLID",
+            "color": {"r": 0.121, "g": 0.466, "b": 0.949, "a": 1.0},
+            "opacity": 1.0,
+            "visible": true
+          }
+        ],
+        "strokes": [],
+        "children": [
+          {
+            "id": "123:457",
+            "name": "label",
+            "type": "TEXT",
+            "absoluteBoundingBox": {"x": 24, "y": 14, "width": 152, "height": 20},
+            "characters": "Continue",
+            "style": {
+              "fontFamily": "Inter",
+              "fontSize": 16,
+              "fontWeight": 600,
+              "lineHeightPx": 20,
+              "letterSpacing": 0
+            },
+            "fills": [
+              {"type": "SOLID", "color": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0}}
+            ],
+            "constraints": {"horizontal": "CENTER", "vertical": "CENTER"}
+          }
+        ]
+      },
+      "components": {},
+      "componentSets": {},
+      "schemaVersion": 0,
+      "styles": {}
+    }
+  }
+}
