@@ -58,7 +58,9 @@ from pixel_mcp.loop_state import (
 )
 from pixel_mcp.normalize import normalize_spec_for_viewport
 from pixel_mcp.render import (
+    VALID_BROWSERS,
     BoundingBox,
+    BrowserNotInstalledError,
     ChromiumNotInstalledError,
     MeasuredDOM,
     PlaywrightNotInstalledError,
@@ -100,6 +102,7 @@ def run(
     enable_omniparser: bool = False,
     omniparser_confidence_threshold: float = 0.3,
     viewports: list[tuple[int, int]] | None = None,
+    browsers: list[str] | None = None,
 ) -> tuple[Envelope, int]:
     """Run one Iteration of the Convergence Loop.
 
@@ -118,16 +121,19 @@ def run(
     economics (iteration counter, stuck detection, regression, max-iter)
     are enforced via ``.pixel-mcp/state.json``.
     """
-    # --- v2-1) Multi-viewport short-circuit ---
-    # When ``viewports`` is set, delegate to the multi-viewport orchestrator.
-    # The single-viewport contract below is preserved exactly when
-    # ``viewports`` is ``None`` (the default) — all v0/v1 tests continue to
-    # exercise the original path.
-    if viewports is not None:
+    # --- v2-1/v2-2) Multi-axis short-circuit ---
+    # When ``viewports`` OR ``browsers`` is set, delegate to the multi-axis
+    # orchestrator. The single-axis contract below is preserved exactly when
+    # both are ``None`` (the defaults) — all v0/v1 tests continue to exercise
+    # the original path. Missing axes degrade to a single-element list
+    # (current viewport / chromium) inside the orchestrator so the same code
+    # path handles 1×N, N×1, and N×M matrices uniformly.
+    if viewports is not None or browsers is not None:
         return _run_multi_viewport(
             figma_url=figma_url,
             route=route,
-            viewports=viewports,
+            viewports=viewports if viewports is not None else [viewport],
+            browsers=browsers if browsers is not None else ["chromium"],
             selectors=selectors,
             wait_for=wait_for,
             refresh_spec=refresh_spec,
@@ -143,6 +149,8 @@ def run(
             enable_human_gate=enable_human_gate,
             enable_omniparser=enable_omniparser,
             omniparser_confidence_threshold=omniparser_confidence_threshold,
+            browsers_specified=browsers is not None,
+            viewports_specified=viewports is not None,
         )
 
     # --- 0a) Validate Design Source selection ---
@@ -602,6 +610,8 @@ def _compute_visual_signals(
     project_root: Path | None = None,
     iteration: int = 0,
     viewport_subfolder: str | None = None,
+    browser_subfolder: str | None = None,
+    browser: str = "chromium",
 ) -> tuple[float | None, list[BoundingBox], list[Any], str | None]:
     """Best-effort visual diff + decomposition.
 
@@ -648,7 +658,12 @@ def _compute_visual_signals(
             with FigmaClient() as client:
                 expected_png = client.fetch_node_png_bytes(parsed.file_id, parsed.node_id)
 
-        actual_png = capture_screenshot(route=route, viewport=viewport, wait_for=wait_for)
+        actual_png = capture_screenshot(
+            route=route,
+            viewport=viewport,
+            wait_for=wait_for,
+            browser=browser,  # type: ignore[arg-type]
+        )
 
         expected_img = np.array(Image.open(io.BytesIO(expected_png)).convert("RGB"))
         actual_img = np.array(Image.open(io.BytesIO(actual_png)).convert("RGB"))
@@ -668,6 +683,7 @@ def _compute_visual_signals(
             crops_dir=crops_root,
             iteration=iteration,
             viewport_subfolder=viewport_subfolder,
+            browser_subfolder=browser_subfolder,
         )
         # Persist the full ``actual`` screenshot per-iteration so the v1.5-2
         # OmniParser augmentation can run on the page-scale image (not just
@@ -677,6 +693,8 @@ def _compute_visual_signals(
         # breakpoint owns an isolated screenshot.
         try:
             iter_dir = crops_root / f"iter-{iteration}"
+            if browser_subfolder:
+                iter_dir = iter_dir / browser_subfolder
             if viewport_subfolder:
                 iter_dir = iter_dir / viewport_subfolder
             iter_dir.mkdir(parents=True, exist_ok=True)
@@ -877,6 +895,7 @@ def _run_omniparser_augmentation(
     confidence_threshold: float,
     project_root: Path | None = None,
     viewport_subfolder: str | None = None,
+    browser_subfolder: str | None = None,
 ) -> tuple[list[Any] | None, str | None]:
     """Run OmniParser on the persisted actual screenshot and tag Regions.
 
@@ -897,6 +916,8 @@ def _run_omniparser_augmentation(
         return None, None
 
     actual_path_dir = state_dir(project_root) / "crops" / f"iter-{iteration}"
+    if browser_subfolder:
+        actual_path_dir = actual_path_dir / browser_subfolder
     if viewport_subfolder:
         actual_path_dir = actual_path_dir / viewport_subfolder
     actual_path = actual_path_dir / "actual.png"
@@ -1058,7 +1079,7 @@ def _run_vlm_gate(
             "failing_deltas": [],
             "promoted": False,
             "hint": (
-                f"Level 2 (VLM) failed at runtime ({exc!s}). " "Falling back to Level 1 verdict."
+                f"Level 2 (VLM) failed at runtime ({exc!s}). Falling back to Level 1 verdict."
             ),
         }
 
@@ -1304,7 +1325,7 @@ def _success_envelope(
         next_action = "Final Convergence at Level 3 (human review). Nothing left to do."
     elif level_reached >= 2 and human_gate_enabled:
         next_action = (
-            "Level 2 Gate Pass. Awaiting Level 3 human verdict — call " "`mcp__pixel_mcp__review`."
+            "Level 2 Gate Pass. Awaiting Level 3 human verdict — call `mcp__pixel_mcp__review`."
         )
     elif level_reached >= 2:
         next_action = (
@@ -1401,12 +1422,17 @@ def _fatal_envelope(error_type: str, error_message: str, hints: list[str]) -> En
     )
 
 
-# --- v2-1 Multi-viewport orchestrator -----------------------------------
+# --- v2-1 / v2-2 Multi-axis orchestrator --------------------------------
 
 
 def _viewport_str(viewport: tuple[int, int]) -> str:
     """Stable ``"<W>x<H>"`` rendering used for hash buckets + on-disk paths."""
     return f"{viewport[0]}x{viewport[1]}"
+
+
+_BROWSER_PRESETS: dict[str, list[str]] = {
+    "all": ["chromium", "firefox", "webkit"],
+}
 
 
 def _stamp_viewport(deltas: list[Delta], viewport_str: str) -> list[Delta]:
@@ -1425,7 +1451,18 @@ def _stamp_viewport(deltas: list[Delta], viewport_str: str) -> list[Delta]:
     return out
 
 
-def _run_one_viewport(
+def _stamp_browser(deltas: list[Delta], browser_str: str) -> list[Delta]:
+    """Return new Deltas with the ``browser`` field set (v2-2 cross-browser)."""
+    out: list[Delta] = []
+    for d in deltas:
+        if d.browser is None:
+            out.append(d.model_copy(update={"browser": browser_str}))
+        else:
+            out.append(d)
+    return out
+
+
+def _run_one_pass(
     *,
     spec: DesignSpec | None,
     image_only: bool,
@@ -1433,6 +1470,7 @@ def _run_one_viewport(
     figma_url: str | None,
     route: str,
     viewport: tuple[int, int],
+    browser: str,
     selectors: list[str] | None,
     wait_for: str | None,
     iteration: int,
@@ -1444,16 +1482,24 @@ def _run_one_viewport(
     vlm_backend: str,
     enable_omniparser: bool,
     omniparser_confidence_threshold: float,
+    namespace_browser: bool = False,
 ) -> tuple[dict[str, Any] | None, tuple[Envelope, int] | None]:
-    """Run the per-viewport pipeline (measure → diff → judge → visual → gates).
+    """Run the per-(browser, viewport) pipeline (measure → diff → judge → visual → gates).
 
     Returns ``(result, None)`` on success, ``(None, (envelope, exit_code))``
-    when the viewport hit a fatal error so the orchestrator can short-circuit
-    the whole check (matches single-viewport semantics — any measure failure
-    aborts the run rather than silently skipping that viewport).
+    when the pass hit a fatal error so the orchestrator can short-circuit
+    the whole check (matches single-pass semantics — any measure failure
+    aborts the run rather than silently skipping that cell of the matrix).
+
+    ``namespace_browser=True`` nests crops under ``browser-<name>/`` to
+    isolate the cross-browser matrix on disk. Defaults to False so callers
+    that only set ``--viewports`` keep the v2-1 layout
+    (``.pixel-mcp/crops/iter-N/viewport-WxH/``) — backward compatibility for
+    the existing v2-1 acceptance tests.
     """
     vp_str = _viewport_str(viewport)
     vp_subfolder = f"viewport-{vp_str}"
+    browser_subfolder = f"browser-{browser}" if namespace_browser else None
 
     # --- Measure ---
     try:
@@ -1462,6 +1508,7 @@ def _run_one_viewport(
             viewport=viewport,
             selectors=selectors,
             wait_for=wait_for,
+            browser=browser,  # type: ignore[arg-type]
         )
     except PlaywrightNotInstalledError as exc:
         return None, (
@@ -1478,6 +1525,18 @@ def _run_one_viewport(
                 "chromium_not_installed",
                 str(exc),
                 ["Run `uv run playwright install chromium` (one-time, ~150MB)."],
+            ),
+            EXIT_FATAL,
+        )
+    except BrowserNotInstalledError as exc:
+        return None, (
+            _fatal_envelope(
+                "browser_not_installed",
+                str(exc),
+                [
+                    "Run `uv run playwright install firefox webkit` (one-time)."
+                    f" Missing engine: {exc.browser}.",
+                ],
             ),
             EXIT_FATAL,
         )
@@ -1532,6 +1591,8 @@ def _run_one_viewport(
         dom=dom,
         iteration=iteration,
         viewport_subfolder=vp_subfolder,
+        browser_subfolder=browser_subfolder,
+        browser=browser,
     )
 
     # --- OmniParser augmentation ---
@@ -1543,6 +1604,7 @@ def _run_one_viewport(
             iteration=iteration,
             confidence_threshold=omniparser_confidence_threshold,
             viewport_subfolder=vp_subfolder,
+            browser_subfolder=browser_subfolder,
         )
 
     # --- Image-only pseudo-Delta synthesis from Hot Regions ---
@@ -1628,18 +1690,25 @@ def _run_one_viewport(
                 tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking),
             )
 
-    # Stamp the viewport onto every Delta + Region produced by this viewport.
+    # Stamp the viewport + browser onto every Delta + Region produced by this pass.
     deltas = _stamp_viewport(deltas, vp_str)
+    deltas = _stamp_browser(deltas, browser)
     for r in regions:
         if getattr(r, "viewport", None) is None:
             try:
                 r.viewport = vp_str
             except (AttributeError, TypeError):
                 pass
+        if getattr(r, "browser", None) is None:
+            try:
+                r.browser = browser
+            except (AttributeError, TypeError):
+                pass
 
     return (
         {
             "viewport": vp_str,
+            "browser": browser,
             "dom": dom,
             "truncated": truncated,
             "deltas": deltas,
@@ -1666,6 +1735,7 @@ def _run_multi_viewport(
     figma_url: str | None,
     route: str,
     viewports: list[tuple[int, int]],
+    browsers: list[str],
     selectors: list[str] | None,
     wait_for: str | None,
     refresh_spec: bool,
@@ -1681,17 +1751,26 @@ def _run_multi_viewport(
     enable_human_gate: bool,
     enable_omniparser: bool,
     omniparser_confidence_threshold: float,
+    browsers_specified: bool = False,
+    viewports_specified: bool = True,
 ) -> tuple[Envelope, int]:
-    """Multi-viewport convergence orchestrator (v2-1).
+    """Multi-axis convergence orchestrator (v2-1 viewports × v2-2 browsers).
 
-    Runs the per-viewport pipeline once per requested ``(W, H)`` pair and
+    Runs the per-(browser, viewport) pipeline once per cell of the matrix and
     aggregates the results. Overall convergence is the AND-fold; the
-    reported ``level_reached`` is the MIN across viewports (worst-case
-    wins). Each Delta + Region produced by a per-viewport pass carries the
-    viewport identifier so the Agent can locate which breakpoint regressed.
+    reported ``level_reached`` is the MIN across cells (worst-case wins).
+    Each Delta + Region produced by a per-pass carries both the viewport and
+    browser identifier so the Agent can locate which (browser × breakpoint)
+    cell regressed.
 
     Session-level concerns (state, history, human gate) run once across the
-    aggregated result — never per viewport.
+    aggregated result — never per pass.
+
+    Backward compatibility: ``viewports_specified`` / ``browsers_specified``
+    control which axes the envelope surfaces; when only ``viewports`` was set
+    by the caller, the envelope keeps the v2-1 shape (``viewport_results``
+    only). When only ``browsers`` was set, ``measurement_results`` is the
+    canonical aggregation key.
     """
     # --- 0a) Design Source validation ---
     if figma_url and image_path:
@@ -1717,6 +1796,19 @@ def _run_multi_viewport(
             "viewports_empty",
             "viewports list must contain at least one (W, H) entry.",
             ["Pass --viewports '1280x720,375x667' or --viewports-preset responsive."],
+        ), EXIT_FATAL
+    if not browsers:
+        return _fatal_envelope(
+            "browsers_empty",
+            "browsers list must contain at least one engine.",
+            ["Pass --browsers 'chromium,firefox' or --browsers-preset all."],
+        ), EXIT_FATAL
+    invalid_browsers = [b for b in browsers if b not in VALID_BROWSERS]
+    if invalid_browsers:
+        return _fatal_envelope(
+            "browsers_invalid",
+            f"Unsupported browser(s): {invalid_browsers}. Choose from {sorted(VALID_BROWSERS)}.",
+            ["Pass --browsers chromium,firefox,webkit or --browsers-preset all."],
         ), EXIT_FATAL
 
     image_only = image_path is not None
@@ -1792,42 +1884,45 @@ def _run_multi_viewport(
                 ["See `pixel-mcp doctor` for environment diagnostics."],
             ), EXIT_FATAL
 
-    # --- 2) Iterate viewports ---
-    viewport_results: list[dict[str, Any]] = []
-    for vp in viewports:
-        result, fatal = _run_one_viewport(
-            spec=spec,
-            image_only=image_only,
-            image_bytes=image_bytes,
-            figma_url=figma_url,
-            route=route,
-            viewport=vp,
-            selectors=selectors,
-            wait_for=wait_for,
-            iteration=state.iteration,
-            treat_minor_as_blocking=treat_minor_as_blocking,
-            enable_dinov2=enable_dinov2,
-            dinov2_threshold=dinov2_threshold,
-            enable_vlm=enable_vlm,
-            vlm_threshold=vlm_threshold,
-            vlm_backend=vlm_backend,
-            enable_omniparser=enable_omniparser,
-            omniparser_confidence_threshold=omniparser_confidence_threshold,
-        )
-        if fatal is not None:
-            # Bubble up the first fatal (matches single-viewport semantics).
-            # State was already incremented; persist so the iteration counter
-            # stays honest across the failed run.
-            write_state(state)
-            return fatal
-        assert result is not None
-        viewport_results.append(result)
+    # --- 2) Iterate cross-product (browsers × viewports) ---
+    pass_results: list[dict[str, Any]] = []
+    for browser_name in browsers:
+        for vp in viewports:
+            result, fatal = _run_one_pass(
+                spec=spec,
+                image_only=image_only,
+                image_bytes=image_bytes,
+                figma_url=figma_url,
+                route=route,
+                viewport=vp,
+                browser=browser_name,
+                selectors=selectors,
+                wait_for=wait_for,
+                iteration=state.iteration,
+                treat_minor_as_blocking=treat_minor_as_blocking,
+                enable_dinov2=enable_dinov2,
+                dinov2_threshold=dinov2_threshold,
+                enable_vlm=enable_vlm,
+                vlm_threshold=vlm_threshold,
+                vlm_backend=vlm_backend,
+                enable_omniparser=enable_omniparser,
+                omniparser_confidence_threshold=omniparser_confidence_threshold,
+                namespace_browser=browsers_specified,
+            )
+            if fatal is not None:
+                # Bubble up the first fatal (matches single-pass semantics).
+                # State was already incremented; persist so the iteration counter
+                # stays honest across the failed run.
+                write_state(state)
+                return fatal
+            assert result is not None
+            pass_results.append(result)
 
     # --- 3) Aggregate ---
-    all_converged = all(r["viewport_converged"] for r in viewport_results)
-    aggregated_level = min(r["level_reached"] for r in viewport_results)
+    all_converged = all(r["viewport_converged"] for r in pass_results)
+    aggregated_level = min(r["level_reached"] for r in pass_results)
     combined_deltas: list[Delta] = []
-    for r in viewport_results:
+    for r in pass_results:
         combined_deltas.extend(r["deltas"])
     combined_judgment = judge_deltas(
         combined_deltas,
@@ -1895,7 +1990,8 @@ def _run_multi_viewport(
             "mode": mode,
             "delta_count": len(combined_deltas),
             "delta_hash": current_hash,
-            "viewports": [r["viewport"] for r in viewport_results],
+            "viewports": sorted({r["viewport"] for r in pass_results}),
+            "browsers": sorted({r["browser"] for r in pass_results}),
             "converged": overall_converged,
             "timestamp": now_utc().isoformat(),
         }
@@ -1904,8 +2000,11 @@ def _run_multi_viewport(
     # --- 6) Build envelope ---
     envelope = _success_envelope_multi(
         spec=spec,
-        viewport_results=viewport_results,
+        pass_results=pass_results,
         viewports=viewports,
+        browsers=browsers,
+        viewports_specified=viewports_specified,
+        browsers_specified=browsers_specified,
         combined_deltas=combined_deltas,
         combined_judgment_data=json.loads(combined_judgment.model_dump_json()),
         overall_converged=overall_converged,
@@ -1941,8 +2040,11 @@ def _run_multi_viewport(
 def _success_envelope_multi(
     *,
     spec: DesignSpec | None,
-    viewport_results: list[dict[str, Any]],
+    pass_results: list[dict[str, Any]],
     viewports: list[tuple[int, int]],
+    browsers: list[str],
+    viewports_specified: bool,
+    browsers_specified: bool,
     combined_deltas: list[Delta],
     combined_judgment_data: dict[str, Any],
     overall_converged: bool,
@@ -1965,15 +2067,18 @@ def _success_envelope_multi(
     omniparser_enabled: bool,
     treat_minor_as_blocking: bool,
 ) -> Envelope:
-    """Build the AXI envelope for a multi-viewport check.
+    """Build the AXI envelope for a multi-axis check (v2-1 + v2-2).
 
-    Mirrors :func:`_success_envelope` but folds in ``data.viewport_results``
-    and ``data.viewports``. Per-viewport entries carry just enough to let the
-    Agent locate the failing breakpoint without dumping per-viewport DOMs.
+    Surfaces ``data.measurement_results`` as the canonical per-pass list
+    (one entry per ``(browser, viewport)`` cell). For backward compatibility
+    with the v2-1 envelope shape, ``data.viewport_results`` is also emitted
+    whenever the caller passed ``viewports`` (independent of whether
+    ``browsers`` was set). The legacy field carries one entry per viewport;
+    when only one browser was used the two lists are content-equivalent.
     """
     delta_dicts = [json.loads(d.model_dump_json()) for d in combined_deltas]
 
-    per_viewport_summary: list[dict[str, Any]] = []
+    measurement_results: list[dict[str, Any]] = []
     aggregated_hot_regions: list[dict[str, Any]] = []
     aggregated_regions: list[dict[str, Any]] = []
     aggregated_dinov2: list[dict[str, Any]] = []
@@ -1981,57 +2086,64 @@ def _success_envelope_multi(
     aggregated_omniparser: list[dict[str, Any]] = []
     hints: list[str] = [combined_judgment_data["summary"]]
 
-    for vr in viewport_results:
-        vp_str = vr["viewport"]
-        ssim_score = vr["ssim_score"]
-        hot_regions = vr["hot_regions"] or []
-        regions = vr["regions"] or []
+    for pr in pass_results:
+        vp_str = pr["viewport"]
+        br_str = pr["browser"]
+        cell_label = f"{br_str} @ {vp_str}"
+        ssim_score = pr["ssim_score"]
+        hot_regions = pr["hot_regions"] or []
+        regions = pr["regions"] or []
         significant = [r for r in hot_regions if r.w * r.h >= MIN_BBOX_AREA]
-        per_viewport_summary.append(
+        measurement_results.append(
             {
+                "browser": br_str,
                 "viewport": vp_str,
-                "converged": vr["viewport_converged"],
-                "level_reached": vr["level_reached"],
+                "converged": pr["viewport_converged"],
+                "level_reached": pr["level_reached"],
                 "ssim_score": ssim_score,
                 "hot_region_count": len(hot_regions),
                 "significant_hot_region_count": len(significant),
-                "delta_count": len(vr["deltas"]),
-                "visual_error": vr["visual_error"],
-                "summary": ("Gate Pass" if vr["viewport_converged"] else "Deltas present"),
+                "delta_count": len(pr["deltas"]),
+                "visual_error": pr["visual_error"],
+                "summary": ("Gate Pass" if pr["viewport_converged"] else "Deltas present"),
             }
         )
         for hr in hot_regions:
             hr_d = json.loads(hr.model_dump_json())
             hr_d["viewport"] = vp_str
+            hr_d["browser"] = br_str
             aggregated_hot_regions.append(hr_d)
         for region in regions:
             aggregated_regions.append(json.loads(region.model_dump_json()))
-        if vr["dinov2_similarities"]:
-            for s in vr["dinov2_similarities"]:
-                aggregated_dinov2.append({**s, "viewport": vp_str})
-        if vr["vlm_judgments"]:
-            for j in vr["vlm_judgments"]:
-                aggregated_vlm.append({**j, "viewport": vp_str})
-        if vr["omniparser_detections"] is not None:
-            for det in vr["omniparser_detections"]:
+        if pr["dinov2_similarities"]:
+            for s in pr["dinov2_similarities"]:
+                aggregated_dinov2.append({**s, "viewport": vp_str, "browser": br_str})
+        if pr["vlm_judgments"]:
+            for j in pr["vlm_judgments"]:
+                aggregated_vlm.append({**j, "viewport": vp_str, "browser": br_str})
+        if pr["omniparser_detections"] is not None:
+            for det in pr["omniparser_detections"]:
                 det_d = json.loads(det.model_dump_json())
                 det_d["viewport"] = vp_str
+                det_d["browser"] = br_str
                 aggregated_omniparser.append(det_d)
 
         if ssim_score is not None and ssim_score < SSIM_THRESHOLD:
             hints.append(
-                f"[{vp_str}] SSIM Score {ssim_score:.3f} below threshold {SSIM_THRESHOLD}."
+                f"[{cell_label}] SSIM Score {ssim_score:.3f} below threshold {SSIM_THRESHOLD}."
             )
         if significant:
-            hints.append(f"[{vp_str}] {len(significant)} Hot Region(s) above {MIN_BBOX_AREA}px².")
-        if vr["visual_error"] is not None:
-            hints.append(f"[{vp_str}] Visual signal unavailable ({vr['visual_error'][:80]}).")
-        if vr["dinov2_hint"]:
-            hints.append(f"[{vp_str}] {vr['dinov2_hint']}")
-        if vr["vlm_hint"]:
-            hints.append(f"[{vp_str}] {vr['vlm_hint']}")
-        if vr["omniparser_hint"]:
-            hints.append(f"[{vp_str}] {vr['omniparser_hint']}")
+            hints.append(
+                f"[{cell_label}] {len(significant)} Hot Region(s) above {MIN_BBOX_AREA}px²."
+            )
+        if pr["visual_error"] is not None:
+            hints.append(f"[{cell_label}] Visual signal unavailable ({pr['visual_error'][:80]}).")
+        if pr["dinov2_hint"]:
+            hints.append(f"[{cell_label}] {pr['dinov2_hint']}")
+        if pr["vlm_hint"]:
+            hints.append(f"[{cell_label}] {pr['vlm_hint']}")
+        if pr["omniparser_hint"]:
+            hints.append(f"[{cell_label}] {pr['omniparser_hint']}")
 
     data: dict[str, Any] = {
         "mode": mode,
@@ -2040,8 +2152,7 @@ def _success_envelope_multi(
         "summary": combined_judgment_data["summary"],
         "judgment": combined_judgment_data,
         "deltas": delta_dicts,
-        "viewports": [_viewport_str(v) for v in viewports],
-        "viewport_results": per_viewport_summary,
+        "measurement_results": measurement_results,
         "hot_regions": aggregated_hot_regions,
         "regions": aggregated_regions,
         "ssim_threshold": SSIM_THRESHOLD,
@@ -2064,12 +2175,34 @@ def _success_envelope_multi(
         "omniparser_enabled": omniparser_enabled,
         "omniparser_detections": (aggregated_omniparser if omniparser_enabled else None),
     }
+    # Surface the axes the caller actually selected. The v2-1 envelope used
+    # ``data.viewports`` + ``data.viewport_results``; keep them when the
+    # caller passed --viewports so v2-1 tests / consumers stay green.
+    if viewports_specified:
+        data["viewports"] = [_viewport_str(v) for v in viewports]
+        # Collapse the cross-product back to a per-viewport summary using the
+        # first browser (the v2-1 shape always had one browser anyway). When
+        # browsers_specified=True too, callers should read measurement_results.
+        first_browser = browsers[0]
+        data["viewport_results"] = [
+            {k: v for k, v in entry.items() if k != "browser"}
+            for entry in measurement_results
+            if entry["browser"] == first_browser
+        ]
+    if browsers_specified:
+        data["browsers"] = list(browsers)
 
-    hints.append(
-        f"Multi-viewport check across {len(viewports)} viewport(s): "
-        + ", ".join(_viewport_str(v) for v in viewports)
-        + "."
-    )
+    axes_desc: list[str] = []
+    if browsers_specified:
+        axes_desc.append(f"{len(browsers)} browser(s)")
+    if viewports_specified:
+        axes_desc.append(f"{len(viewports)} viewport(s)")
+    if axes_desc:
+        hints.append(
+            "Cross-product check across "
+            + " × ".join(axes_desc)
+            + f" = {len(pass_results)} measurement pass(es)."
+        )
     hints.append(f"Iteration {iteration} of {max_iterations}.")
     if is_stuck:
         hints.append(
@@ -2080,7 +2213,7 @@ def _success_envelope_multi(
     if is_regression:
         hints.append(
             "REGRESSION: a previously-passed Level is now failing across the "
-            "viewport matrix. A recent edit broke a breakpoint that used to work."
+            "matrix. A recent edit broke a (browser, viewport) cell that used to work."
         )
     if human_gate_enabled and human_gate_pending:
         hints.append(
@@ -2091,40 +2224,44 @@ def _success_envelope_multi(
     if not overall_converged:
         next_action = (
             "Have the Agent fix the listed Deltas (note the per-Delta "
-            "`viewport` field), then re-invoke `mcp__pixel_mcp__check`."
+            "`browser` + `viewport` fields), then re-invoke `mcp__pixel_mcp__check`."
         )
     elif level_reached >= 3:
-        next_action = "Final Convergence at Level 3 across all viewports."
+        next_action = "Final Convergence at Level 3 across the full matrix."
     elif level_reached >= 2 and human_gate_enabled:
-        next_action = "Level 2 Gate Pass across viewports. Awaiting Level 3 human verdict."
+        next_action = "Level 2 Gate Pass across the matrix. Awaiting Level 3 human verdict."
     elif level_reached >= 2:
         next_action = (
-            "Level 2 Gate Pass across viewports. Promote to Level 3 by re-running "
+            "Level 2 Gate Pass across the matrix. Promote to Level 3 by re-running "
             "with `--enable-human-gate`."
         )
     elif level_reached >= 1:
         next_action = (
-            "Level 1 Gate Pass across viewports. Promote to Level 2 by re-running "
+            "Level 1 Gate Pass across the matrix. Promote to Level 2 by re-running "
             "`pixel-mcp check --enable-vlm`."
         )
     else:
         next_action = (
-            "Level 0 Gate Pass across viewports. Promote to Level 1 by re-running "
+            "Level 0 Gate Pass across the matrix. Promote to Level 1 by re-running "
             "`pixel-mcp check --enable-dinov2`."
         )
+
+    diagnostics: dict[str, Any] = {
+        "mode": mode,
+        "viewport_count": len(viewports),
+        "browser_count": len(browsers),
+        "pass_count": len(pass_results),
+        "delta_count": len(combined_deltas),
+        "critical_count": combined_judgment_data["critical_count"],
+        "major_count": combined_judgment_data["major_count"],
+        "minor_count": combined_judgment_data["minor_count"],
+        "regression_count": combined_judgment_data["regression_count"],
+    }
 
     return make_envelope(
         data=data,
         hints=hints,
-        diagnostics={
-            "mode": mode,
-            "viewport_count": len(viewports),
-            "delta_count": len(combined_deltas),
-            "critical_count": combined_judgment_data["critical_count"],
-            "major_count": combined_judgment_data["major_count"],
-            "minor_count": combined_judgment_data["minor_count"],
-            "regression_count": combined_judgment_data["regression_count"],
-        },
+        diagnostics=diagnostics,
         next_suggested_action=next_action,
         affordances=[
             {

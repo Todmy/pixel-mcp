@@ -89,3 +89,17 @@ def test_omniparser_overrides_via_config_file(tmp_path: Path) -> None:
     cfg = load_project_config(project_root=tmp_path)
     assert cfg.enable_omniparser is True
     assert cfg.omniparser_confidence_threshold == pytest.approx(0.5)
+
+
+def test_enabled_browsers_defaults_to_chromium_only() -> None:
+    """v2-2 cross-browser is opt-in — default config keeps chromium only."""
+    cfg = ProjectConfig()
+    assert cfg.enabled_browsers == ["chromium"]
+
+
+def test_enabled_browsers_overrides_via_config_file(tmp_path: Path) -> None:
+    (tmp_path / ".pixel-mcp.json").write_text(
+        '{"enabled_browsers": ["chromium", "firefox", "webkit"]}'
+    )
+    cfg = load_project_config(project_root=tmp_path)
+    assert cfg.enabled_browsers == ["chromium", "firefox", "webkit"]

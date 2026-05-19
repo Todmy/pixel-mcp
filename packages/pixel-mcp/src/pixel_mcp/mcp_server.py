@@ -159,6 +159,7 @@ def check(
     enable_omniparser: bool = False,
     omniparser_confidence_threshold: float = 0.3,
     viewports: list[list[int]] | None = None,
+    browsers: list[str] | None = None,
 ) -> dict[str, Any]:
     """One Iteration of the Convergence Loop.
 
@@ -221,6 +222,7 @@ def check(
         route=route,
         viewport=(viewport_width, viewport_height),
         viewports=parsed_viewports,
+        browsers=browsers,
         selectors=selectors,
         wait_for=wait_for,
         refresh_spec=refresh_spec,

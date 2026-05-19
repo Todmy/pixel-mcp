@@ -62,6 +62,13 @@ class Delta(BaseModel):
     backward compatible. Different viewports produce different hash buckets so
     stuck/regression detection stays accurate across the responsive matrix."""
 
+    browser: str | None = None
+    """Browser engine (``"chromium"``/``"firefox"``/``"webkit"``) when the
+    Delta was produced under a v2-2 cross-browser check. ``None`` for callers
+    that did not specify ``--browsers`` — fully backward compatible. Folded
+    into the magnitude-bucket hash so the same property mismatch observed
+    under different engines hashes to distinct buckets."""
+
 
 class _FlatSpecNode(BaseModel):
     """Flattened view of a node in the DesignSpec tree — used internally for pairing."""

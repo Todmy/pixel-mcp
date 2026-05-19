@@ -43,8 +43,7 @@ def _check_python_version() -> CheckResult:
         "name": "python_version",
         "status": "red",
         "detail": (
-            f"Python {current[0]}.{current[1]} is below required "
-            f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
+            f"Python {current[0]}.{current[1]} is below required {MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
         ),
     }
 
@@ -63,6 +62,34 @@ def _check_playwright() -> CheckResult:
     }
 
 
+def _playwright_cache_roots() -> list[pathlib.Path]:
+    home = pathlib.Path.home()
+    candidate_roots = [
+        home / "Library" / "Caches" / "ms-playwright",  # macOS
+        home / ".cache" / "ms-playwright",  # Linux
+        home / "AppData" / "Local" / "ms-playwright",  # Windows
+    ]
+    env_override = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if env_override:
+        candidate_roots.insert(0, pathlib.Path(env_override))
+    return candidate_roots
+
+
+def _find_browser_binary(prefixes: tuple[str, ...]) -> pathlib.Path | None:
+    """Return the first Playwright cache entry whose name starts with any prefix."""
+    for root in _playwright_cache_roots():
+        if not root.exists():
+            continue
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name.startswith(prefixes):
+                return entry
+    return None
+
+
 def _check_chromium() -> CheckResult:
     """Chromium browser binary readiness.
 
@@ -78,36 +105,67 @@ def _check_chromium() -> CheckResult:
             "detail": "Skipped — playwright not installed yet",
         }
 
-    home = pathlib.Path.home()
-    candidate_roots = [
-        home / "Library" / "Caches" / "ms-playwright",  # macOS
-        home / ".cache" / "ms-playwright",  # Linux
-        home / "AppData" / "Local" / "ms-playwright",  # Windows
-    ]
-    env_override = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
-    if env_override:
-        candidate_roots.insert(0, pathlib.Path(env_override))
-
-    for root in candidate_roots:
-        if not root.exists():
-            continue
-        try:
-            entries = list(root.iterdir())
-        except OSError:
-            continue
-        for entry in entries:
-            name = entry.name
-            if name.startswith("chromium-") or name.startswith("chromium_headless_shell-"):
-                return {
-                    "name": "chromium",
-                    "status": "green",
-                    "detail": f"chromium binary present at {entry}",
-                }
-
+    found = _find_browser_binary(("chromium-", "chromium_headless_shell-"))
+    if found is not None:
+        return {
+            "name": "chromium",
+            "status": "green",
+            "detail": f"chromium binary present at {found}",
+        }
     return {
         "name": "chromium",
         "status": "amber",
         "detail": "Chromium binary missing (run `uv run playwright install chromium`)",
+    }
+
+
+def _check_firefox() -> CheckResult:
+    """Firefox browser binary readiness (v2-2 cross-browser check)."""
+    if importlib.util.find_spec("playwright") is None:
+        return {
+            "name": "firefox_browser",
+            "status": "amber",
+            "detail": "Skipped — playwright not installed yet",
+        }
+    found = _find_browser_binary(("firefox-",))
+    if found is not None:
+        return {
+            "name": "firefox_browser",
+            "status": "green",
+            "detail": f"firefox binary present at {found}",
+        }
+    return {
+        "name": "firefox_browser",
+        "status": "red",
+        "detail": (
+            "Firefox binary missing — cross-browser check requires "
+            "`uv run playwright install firefox webkit`."
+        ),
+    }
+
+
+def _check_webkit() -> CheckResult:
+    """WebKit browser binary readiness (v2-2 cross-browser check)."""
+    if importlib.util.find_spec("playwright") is None:
+        return {
+            "name": "webkit_browser",
+            "status": "amber",
+            "detail": "Skipped — playwright not installed yet",
+        }
+    found = _find_browser_binary(("webkit-",))
+    if found is not None:
+        return {
+            "name": "webkit_browser",
+            "status": "green",
+            "detail": f"webkit binary present at {found}",
+        }
+    return {
+        "name": "webkit_browser",
+        "status": "red",
+        "detail": (
+            "WebKit binary missing — cross-browser check requires "
+            "`uv run playwright install firefox webkit`."
+        ),
     }
 
 
@@ -282,9 +340,7 @@ def _check_pixel_mcp_ml_omniparser() -> CheckResult:
     return {
         "name": "pixel_mcp_ml_omniparser",
         "status": "amber",
-        "detail": (
-            "pixel-mcp-ml installed but OmniParser backend missing: " f"{', '.join(missing)}"
-        ),
+        "detail": (f"pixel-mcp-ml installed but OmniParser backend missing: {', '.join(missing)}"),
     }
 
 
@@ -368,6 +424,8 @@ def run_checks() -> list[CheckResult]:
         _check_python_version(),
         _check_playwright(),
         _check_chromium(),
+        _check_firefox(),
+        _check_webkit(),
         _check_figma_token(),
         _check_httpx(),
         _check_figma_api_reachable(),
@@ -410,6 +468,13 @@ def _hints_for(checks: list[CheckResult]) -> list[str]:
                 "Start Ollama: `ollama serve` (one-time install: "
                 "`brew install ollama`). Only required for `--backend qwen-local`."
             )
+        elif c["name"] in ("firefox_browser", "webkit_browser"):
+            hint = (
+                "Install firefox + webkit for v2-2 cross-browser check: "
+                "`uv run playwright install firefox webkit`."
+            )
+            if hint not in hints:
+                hints.append(hint)
     for c in checks:
         if c["status"] != "amber":
             continue
@@ -502,7 +567,9 @@ def build_envelope() -> Envelope:
     )
 
 
-_OPTIONAL_RED_CHECKS = frozenset({"ollama_qwen", "pixel_mcp_ml_omniparser"})
+_OPTIONAL_RED_CHECKS = frozenset(
+    {"ollama_qwen", "pixel_mcp_ml_omniparser", "firefox_browser", "webkit_browser"}
+)
 """Checks whose red status is informational, not fatal.
 
 The ``qwen-local`` backend is an opt-in alternative to the default
@@ -510,7 +577,11 @@ Claude path — most operators never need it, so an unreachable Ollama
 daemon should not flip the doctor exit code.
 
 OmniParser is opt-in detection infrastructure (v1.5 PRD) — until v1.5-2
-wires it into ``check``, missing the extra is informational only."""
+wires it into ``check``, missing the extra is informational only.
+
+``firefox_browser`` / ``webkit_browser`` are opt-in cross-browser
+extras (v2-2). Default chromium-only callers should not see doctor flip
+red just because the v2-2 engines are not installed."""
 
 
 def exit_code_for(envelope: Envelope) -> int:

@@ -1452,3 +1452,155 @@ def test_vlm_prompt_unchanged_when_semantic_label_absent(
     # Backward-compat path: no context_labels kwarg passed.
     assert fake_vlm.call_count == 1
     assert "context_labels" not in fake_vlm.call_args.kwargs
+
+
+# ---------------------------------------------------------------------------
+# v2-2 — Cross-browser check
+# ---------------------------------------------------------------------------
+
+
+def test_single_browser_backward_compat(mocked_pipeline: Any) -> None:
+    """``browsers=None`` → measure_render called with browser='chromium' once."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    envelope, exit_code = check_run(
+        figma_url="https://figma.com/design/abc?node-id=1-1",
+        route="http://localhost:3000/",
+    )
+    assert exit_code == EXIT_CONVERGED
+    # Default chromium-only path: measure_render is called exactly once for
+    # the single viewport, with the default browser kwarg (chromium).
+    assert m_measure.call_count == 1
+    # No multi-axis surface should leak into the envelope.
+    assert "browsers" not in envelope["data"]
+    assert "measurement_results" not in envelope["data"]
+
+
+def test_cross_browser_runs_per_engine(mocked_pipeline: Any) -> None:
+    """``browsers=['chromium','firefox']`` → measure_render called twice."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    envelope, exit_code = check_run(
+        figma_url="https://figma.com/design/abc?node-id=1-1",
+        route="http://localhost:3000/",
+        browsers=["chromium", "firefox"],
+    )
+    assert exit_code == EXIT_CONVERGED
+    # One measure per browser at the single default viewport.
+    assert m_measure.call_count == 2
+    seen_browsers = {call.kwargs.get("browser") for call in m_measure.call_args_list}
+    assert seen_browsers == {"chromium", "firefox"}
+    assert envelope["data"]["browsers"] == ["chromium", "firefox"]
+    mr = envelope["data"]["measurement_results"]
+    assert isinstance(mr, list) and len(mr) == 2
+    assert {entry["browser"] for entry in mr} == {"chromium", "firefox"}
+
+
+def test_browsers_and_viewports_cross_product(mocked_pipeline: Any) -> None:
+    """2 browsers × 2 viewports = 4 measurement passes."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    envelope, exit_code = check_run(
+        figma_url="https://figma.com/design/abc?node-id=1-1",
+        route="http://localhost:3000/",
+        viewports=[(1280, 720), (375, 667)],
+        browsers=["chromium", "firefox"],
+    )
+    assert exit_code == EXIT_CONVERGED
+    assert m_measure.call_count == 4
+    mr = envelope["data"]["measurement_results"]
+    cells = {(entry["browser"], entry["viewport"]) for entry in mr}
+    assert cells == {
+        ("chromium", "1280x720"),
+        ("chromium", "375x667"),
+        ("firefox", "1280x720"),
+        ("firefox", "375x667"),
+    }
+    assert envelope["data"]["browsers"] == ["chromium", "firefox"]
+    assert envelope["data"]["viewports"] == ["1280x720", "375x667"]
+
+
+def test_browser_specific_failure_short_circuits(mocked_pipeline: Any) -> None:
+    """Firefox launch error → exit 12 with a clear hint."""
+    from pixel_mcp.render import BrowserNotInstalledError
+
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+
+    def _measure_side_effect(*_args: Any, **kwargs: Any) -> tuple[MeasuredDOM, bool]:
+        if kwargs.get("browser") == "firefox":
+            raise BrowserNotInstalledError("firefox")
+        return _dom(bg="#ff0000"), False
+
+    m_measure.side_effect = _measure_side_effect
+
+    envelope, exit_code = check_run(
+        figma_url="https://figma.com/design/abc?node-id=1-1",
+        route="http://localhost:3000/",
+        browsers=["chromium", "firefox"],
+    )
+    assert exit_code == EXIT_FATAL
+    assert envelope["data"] is None
+    assert envelope["diagnostics"]["error_type"] == "browser_not_installed"
+    joined_hints = " ".join(envelope["hints"])
+    assert "playwright install firefox webkit" in joined_hints
+
+
+def test_deltas_carry_browser_field(mocked_pipeline: Any) -> None:
+    """Every Delta produced under cross-browser carries the browser string."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#00ff00"), False)  # delta on every cell
+
+    envelope, exit_code = check_run(
+        figma_url="https://figma.com/design/abc?node-id=1-1",
+        route="http://localhost:3000/",
+        browsers=["chromium", "firefox"],
+    )
+    assert exit_code == EXIT_DELTAS
+    deltas = envelope["data"]["deltas"]
+    assert deltas, "expected aggregated Deltas across browsers"
+    browser_values = {d["browser"] for d in deltas}
+    assert browser_values == {"chromium", "firefox"}
+    # Single viewport at default; browser field is the diff axis.
+    assert all(d["browser"] in {"chromium", "firefox"} for d in deltas)
+
+
+def test_browsers_preset_all_expands_to_three(tmp_path: Path, mocked_pipeline: Any) -> None:
+    """`--browsers-preset all` expands to chromium, firefox, webkit."""
+    from pixel_mcp.cli import app
+    from typer.testing import CliRunner
+
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    runner = CliRunner()
+    out = tmp_path / "envelope.json"
+    result = runner.invoke(
+        app,
+        [
+            "check",
+            "--figma",
+            "https://figma.com/design/abc?node-id=1-1",
+            "--route",
+            "http://localhost:3000/",
+            "--browsers-preset",
+            "all",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(out.read_text())
+    assert envelope["data"]["browsers"] == ["chromium", "firefox", "webkit"]
+    assert envelope["data"]["converged"] is True
+    assert m_measure.call_count == 3
+    seen_browsers = {call.kwargs.get("browser") for call in m_measure.call_args_list}
+    assert seen_browsers == {"chromium", "firefox", "webkit"}

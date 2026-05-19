@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Optional
 
 import typer
 from pixel_tools_shared import Envelope
@@ -111,7 +110,7 @@ def spec(
         "--figma",
         help="Figma URL — Frame, Component Instance, or Master Component.",
     ),
-    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+    out: Path | None = typer.Option(  # noqa: B008, UP007
         None,
         "--out",
         help="Write the AXI envelope JSON to this file. Defaults to stdout.",
@@ -180,6 +179,45 @@ def _parse_viewports(raw: str | None, preset: str | None) -> list[tuple[int, int
     return [_parse_viewport(p) for p in parts]
 
 
+_BROWSER_PRESETS: dict[str, str] = {
+    "all": "chromium,firefox,webkit",
+}
+
+
+def _parse_browsers(raw: str | None, preset: str | None) -> list[str] | None:
+    """Resolve the cross-browser list from ``--browsers`` / ``--browsers-preset``.
+
+    Returns ``None`` when neither flag is set (single-browser behaviour
+    preserved). When both are set, the explicit ``--browsers`` value wins
+    and a Typer warning surfaces. Browser names are validated against the
+    Playwright engines the harness supports.
+    """
+    valid = {"chromium", "firefox", "webkit"}
+    chosen: str | None = None
+    if raw is not None:
+        chosen = raw
+        if preset is not None:
+            typer.echo(
+                f"--browsers overrides --browsers-preset={preset!r}.",
+                err=True,
+            )
+    elif preset is not None:
+        if preset not in _BROWSER_PRESETS:
+            raise typer.BadParameter(
+                f"Unknown browser preset {preset!r}. Known: {', '.join(sorted(_BROWSER_PRESETS))}."
+            )
+        chosen = _BROWSER_PRESETS[preset]
+    if chosen is None:
+        return None
+    parts = [p.strip().lower() for p in chosen.split(",") if p.strip()]
+    if not parts:
+        return None
+    invalid = [p for p in parts if p not in valid]
+    if invalid:
+        raise typer.BadParameter(f"Unknown browser(s): {invalid}. Choose from {sorted(valid)}.")
+    return parts
+
+
 def _parse_selectors(raw: str | None) -> list[str] | None:
     if raw is None:
         return None
@@ -194,7 +232,7 @@ def measure(
         "--route",
         help="URL of the Render (e.g. http://localhost:3000/foo).",
     ),
-    selectors: Optional[str] = typer.Option(  # noqa: B008, UP007
+    selectors: str | None = typer.Option(  # noqa: B008, UP007
         None,
         "--selectors",
         help="Comma-separated CSS selectors to measure. If omitted, auto-discover visible elements.",
@@ -204,12 +242,12 @@ def measure(
         "--viewport",
         help="Viewport size as WIDTHxHEIGHT (default 1280x720).",
     ),
-    wait_for: Optional[str] = typer.Option(  # noqa: B008, UP007
+    wait_for: str | None = typer.Option(  # noqa: B008, UP007
         None,
         "--wait-for",
         help="CSS selector that must appear before measurement begins.",
     ),
-    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+    out: Path | None = typer.Option(  # noqa: B008, UP007
         None,
         "--out",
         help="Write the AXI envelope JSON to this file. Defaults to stdout.",
@@ -242,7 +280,7 @@ def diff(
         "--measured",
         help="Path to a MeasuredDOM JSON (produced by `pixel-mcp measure --out`).",
     ),
-    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+    out: Path | None = typer.Option(  # noqa: B008, UP007
         None,
         "--out",
         help="Write the AXI envelope JSON to this file. Defaults to stdout.",
@@ -266,7 +304,7 @@ def judge(
         "--strict",
         help="Treat minor Deltas as blocking.",
     ),
-    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+    out: Path | None = typer.Option(  # noqa: B008, UP007
         None,
         "--out",
         help="Write the AXI envelope JSON to this file. Defaults to stdout.",
@@ -280,13 +318,13 @@ def judge(
 
 @app.command()
 def check(
-    figma: Optional[str] = typer.Option(  # noqa: B008, UP007
+    figma: str | None = typer.Option(  # noqa: B008, UP007
         None,
         "--figma",
         help="Figma URL — Frame, Component Instance, or Master Component. "
         "Mutually exclusive with --image.",
     ),
-    image: Optional[Path] = typer.Option(  # noqa: B008, UP007
+    image: Path | None = typer.Option(  # noqa: B008, UP007
         None,
         "--image",
         help="Path to a static design image (PNG/JPG) — image-only mode. "
@@ -297,7 +335,7 @@ def check(
         "--route",
         help="URL of the Render (e.g. http://localhost:3000/foo).",
     ),
-    selectors: Optional[str] = typer.Option(  # noqa: B008, UP007
+    selectors: str | None = typer.Option(  # noqa: B008, UP007
         None,
         "--selectors",
         help="Comma-separated CSS selectors to measure. Auto-discover when omitted.",
@@ -307,20 +345,32 @@ def check(
         "--viewport",
         help="Viewport size as WIDTHxHEIGHT (default 1280x720). Ignored when --viewports is set.",
     ),
-    viewports: Optional[str] = typer.Option(  # noqa: B008, UP007
+    viewports: str | None = typer.Option(  # noqa: B008, UP007
         None,
         "--viewports",
         help="Comma-separated viewport list (e.g. '1280x720,375x667,768x1024'). "
         "Runs the full convergence pipeline at each viewport (v2-1). "
         "Mutually compatible with --viewport — when both are set, --viewports wins.",
     ),
-    viewports_preset: Optional[str] = typer.Option(  # noqa: B008, UP007
+    viewports_preset: str | None = typer.Option(  # noqa: B008, UP007
         None,
         "--viewports-preset",
         help="Convenience: expand a named preset to --viewports. "
         "'responsive' = 1280x720,768x1024,375x667.",
     ),
-    wait_for: Optional[str] = typer.Option(  # noqa: B008, UP007
+    browsers: str | None = typer.Option(  # noqa: B008, UP007
+        None,
+        "--browsers",
+        help="Comma-separated Playwright engines (e.g. 'chromium,firefox,webkit'). "
+        "When set, runs the convergence pipeline at each engine (v2-2). "
+        "Combines naturally with --viewports for a full (browser × viewport) matrix.",
+    ),
+    browsers_preset: str | None = typer.Option(  # noqa: B008, UP007
+        None,
+        "--browsers-preset",
+        help="Convenience: expand a named browser preset. 'all' = chromium,firefox,webkit.",
+    ),
+    wait_for: str | None = typer.Option(  # noqa: B008, UP007
         None,
         "--wait-for",
         help="CSS selector that must appear before measurement begins.",
@@ -379,7 +429,7 @@ def check(
         "--omniparser-confidence-threshold",
         help="Drop OmniParser detections below this confidence (default 0.3).",
     ),
-    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+    out: Path | None = typer.Option(  # noqa: B008, UP007
         None,
         "--out",
         help="Write the AXI envelope JSON to this file. Defaults to stdout.",
@@ -392,12 +442,14 @@ def check(
     Exactly one of ``--figma`` or ``--image`` must be provided.
     """
     parsed_viewports = _parse_viewports(viewports, viewports_preset)
+    parsed_browsers = _parse_browsers(browsers, browsers_preset)
     envelope, exit_code = check_cmd_mod.run(
         figma_url=figma,
         image_path=image,
         route=route,
         viewport=_parse_viewport(viewport),
         viewports=parsed_viewports,
+        browsers=parsed_browsers,
         selectors=_parse_selectors(selectors),
         wait_for=wait_for,
         refresh_spec=refresh_spec,
@@ -425,7 +477,7 @@ def _emit(envelope: Envelope, out: Path | None) -> None:
 
 @app.command()
 def review(
-    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+    out: Path | None = typer.Option(  # noqa: B008, UP007
         None, "--out", help="Write the AXI envelope JSON to this file."
     ),
 ) -> None:
@@ -442,13 +494,13 @@ def human_feedback(
         "--approve",
         help="Sign off — record Final Convergence at Level 3 on the next check.",
     ),
-    rejection_notes: Optional[str] = typer.Option(  # noqa: B008, UP007
+    rejection_notes: str | None = typer.Option(  # noqa: B008, UP007
         None,
         "--rejection-notes",
         help="Reject the review packet and inject the given notes as a "
         "pseudo-Delta on the next check.",
     ),
-    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+    out: Path | None = typer.Option(  # noqa: B008, UP007
         None, "--out", help="Write the AXI envelope JSON to this file."
     ),
 ) -> None:
@@ -477,7 +529,7 @@ def mapping(
         "--viewport",
         help="Viewport size as WIDTHxHEIGHT (default 1280x720).",
     ),
-    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+    out: Path | None = typer.Option(  # noqa: B008, UP007
         None,
         "--out",
         help="Write the AXI envelope JSON to this file. Defaults to stdout.",
@@ -500,7 +552,7 @@ def snapshot(
     viewport: str = typer.Option(  # noqa: B008
         "1280x720", "--viewport", help="Viewport size as WIDTHxHEIGHT."
     ),
-    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+    out: Path | None = typer.Option(  # noqa: B008, UP007
         None, "--out", help="Write the AXI envelope JSON to this file."
     ),
 ) -> None:
@@ -517,7 +569,7 @@ def reset(
     all_artifacts: bool = typer.Option(  # noqa: B008
         False, "--all", help="Also remove named snapshots."
     ),
-    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+    out: Path | None = typer.Option(  # noqa: B008, UP007
         None, "--out", help="Write the AXI envelope JSON to this file."
     ),
 ) -> None:

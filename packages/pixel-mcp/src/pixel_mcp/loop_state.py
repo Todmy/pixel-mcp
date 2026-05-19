@@ -130,14 +130,15 @@ def bucket_for_magnitude(magnitude: float | None) -> str:
 
 
 def hash_deltas_bucketed(deltas: list[Delta]) -> str:
-    """Hash a Delta[] by (selector, property, magnitude_bucket, severity, viewport).
+    """Hash a Delta[] by (selector, property, magnitude_bucket, severity, viewport, browser).
 
-    The ``viewport`` field (v2-1) is folded in so the same property mismatch
-    observed under different viewports hashes to distinct buckets — stuck
-    detection stays accurate when one viewport regresses while another
-    converges. Single-viewport callers have ``viewport=None`` (rendered as
-    the empty string) which keeps cross-version hash semantics stable for
-    the no-viewport case.
+    The ``viewport`` field (v2-1) and ``browser`` field (v2-2) are folded in so
+    the same property mismatch observed under different breakpoints / engines
+    hashes to distinct buckets — stuck detection stays accurate when one cell
+    of the (browser × viewport) matrix regresses while another converges.
+    Pre-v2-1/v2-2 callers leave those fields as ``None`` (rendered as the
+    empty string), which keeps cross-version hash semantics stable for the
+    single-viewport / single-browser case.
     """
     rows = sorted(
         (
@@ -147,10 +148,11 @@ def hash_deltas_bucketed(deltas: list[Delta]) -> str:
                 bucket_for_magnitude(d.magnitude),
                 d.severity,
                 d.viewport or "",
+                d.browser or "",
             )
             for d in deltas
         ),
-        key=lambda t: (t[0], t[1], t[2], t[3], t[4]),
+        key=lambda t: (t[0], t[1], t[2], t[3], t[4], t[5]),
     )
     payload = json.dumps(rows, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

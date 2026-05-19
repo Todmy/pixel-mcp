@@ -54,6 +54,10 @@ class Region(BaseModel):
     viewport: str | None = None
     """Viewport identifier (``"<W>x<H>"``) when the Region was produced under
     a multi-viewport check. ``None`` for single-viewport callers."""
+    browser: str | None = None
+    """Browser identifier (``"chromium"``/``"firefox"``/``"webkit"``) when the
+    Region was produced under a v2-2 cross-browser check. ``None`` for callers
+    that did not specify ``--browsers``."""
 
 
 def decompose_hot_regions(
@@ -66,6 +70,7 @@ def decompose_hot_regions(
     iteration: int = 0,
     mappings: dict[str, str] | None = None,
     viewport_subfolder: str | None = None,
+    browser_subfolder: str | None = None,
 ) -> list[Region]:
     """Attribute each Hot Region to a DOM element and emit a Region list.
 
@@ -104,6 +109,8 @@ def decompose_hot_regions(
     iter_dir: Path | None = None
     if crops_dir is not None and expected_image is not None and actual_image is not None:
         iter_dir = crops_dir / f"iter-{iteration}"
+        if browser_subfolder:
+            iter_dir = iter_dir / browser_subfolder
         if viewport_subfolder:
             iter_dir = iter_dir / viewport_subfolder
         iter_dir.mkdir(parents=True, exist_ok=True)
@@ -115,6 +122,12 @@ def decompose_hot_regions(
         region_viewport = viewport_subfolder[len("viewport-") :]
     elif viewport_subfolder:
         region_viewport = viewport_subfolder
+
+    region_browser: str | None = None
+    if browser_subfolder and browser_subfolder.startswith("browser-"):
+        region_browser = browser_subfolder[len("browser-") :]
+    elif browser_subfolder:
+        region_browser = browser_subfolder
 
     out: list[Region] = []
     for i, region in enumerate(hot_regions):
@@ -140,6 +153,7 @@ def decompose_hot_regions(
                 expected_crop_path=exp_path,
                 actual_crop_path=act_path,
                 viewport=region_viewport,
+                browser=region_browser,
             )
         )
     return out

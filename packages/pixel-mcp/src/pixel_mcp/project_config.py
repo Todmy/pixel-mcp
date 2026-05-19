@@ -65,6 +65,7 @@ class ProjectConfig(BaseModel):
     enable_omniparser: bool = False
     omniparser_confidence_threshold: float = 0.3
     viewport: ViewportConfig = Field(default_factory=ViewportConfig)
+    enabled_browsers: list[str] = Field(default_factory=lambda: ["chromium"])
     mask_regions: list[MaskRegion] = Field(default_factory=list)
     figma_token_env: str = "FIGMA_TOKEN"
 

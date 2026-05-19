@@ -22,9 +22,20 @@ Design notes:
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+BrowserName = Literal["chromium", "firefox", "webkit"]
+"""Playwright browser engines wired through :func:`measure_render` and
+:func:`capture_screenshot`. Defaults to ``"chromium"`` everywhere so v0/v1
+callers keep their behaviour.
+"""
+
+VALID_BROWSERS: frozenset[str] = frozenset({"chromium", "firefox", "webkit"})
+"""All Playwright engines wired through the v2-2 cross-browser check."""
+
+_VALID_BROWSERS = VALID_BROWSERS  # internal alias kept for back-compat
 
 MAX_ELEMENTS = 200
 """Cap on auto-discovered elements per measurement. Prevents envelope bloat."""
@@ -43,6 +54,23 @@ class PlaywrightNotInstalledError(RenderError):
 
 class ChromiumNotInstalledError(RenderError):
     """Chromium browser binary is not present."""
+
+
+class BrowserNotInstalledError(RenderError):
+    """A non-default Playwright engine (firefox / webkit) binary is missing.
+
+    Distinct from :class:`ChromiumNotInstalledError` so the v2-2 cross-browser
+    orchestrator can surface a tailored hint pointing at
+    ``uv run playwright install firefox webkit`` instead of the chromium-only
+    install path.
+    """
+
+    def __init__(self, browser: str, original: Exception | None = None) -> None:
+        self.browser = browser
+        super().__init__(
+            f"Playwright browser binary for {browser!r} not found. Run "
+            "`uv run playwright install firefox webkit` (one-time)."
+        )
 
 
 class RouteUnreachableError(RenderError):
@@ -353,20 +381,31 @@ def measure_render(
     wait_for: str | None = None,
     wait_for_network_idle: bool = True,
     timeout_ms: int = 15_000,
+    browser: BrowserName = "chromium",
 ) -> tuple[MeasuredDOM, bool]:
-    """Drive Chromium against ``route`` and return the MeasuredDOM.
+    """Drive a Playwright browser against ``route`` and return the MeasuredDOM.
 
     Returns ``(measured_dom, truncated)``. ``truncated`` is True when
     auto-discover hit the :data:`MAX_ELEMENTS` cap — the calling layer
     surfaces this as a hint.
 
+    ``browser`` selects the Playwright engine (``"chromium"`` / ``"firefox"``
+    / ``"webkit"``). Defaults to chromium so v0/v1 callers retain their
+    behaviour; v2-2 cross-browser orchestrators thread the value through.
+
     Raises:
         PlaywrightNotInstalledError: ``playwright`` module not importable.
         ChromiumNotInstalledError: Chromium binary missing (run
             ``uv run playwright install chromium``).
+        BrowserNotInstalledError: firefox/webkit binary missing (run
+            ``uv run playwright install firefox webkit``).
         RouteUnreachableError: navigation to ``route`` failed.
         WaitForTimeoutError: ``wait_for`` selector never appeared.
     """
+    if browser not in _VALID_BROWSERS:
+        raise RenderError(
+            f"Unsupported browser {browser!r}. Choose one of: {sorted(_VALID_BROWSERS)}."
+        )
     try:
         from playwright.sync_api import (  # noqa: PLC0415  (lazy import)
             Error as PlaywrightError,
@@ -379,26 +418,28 @@ def measure_render(
         )
     except ImportError as exc:
         raise PlaywrightNotInstalledError(
-            "playwright is not installed. Run `uv sync` then "
-            "`uv run playwright install chromium`."
+            "playwright is not installed. Run `uv sync` then `uv run playwright install chromium`."
         ) from exc
 
     truncated = False
     try:
         with sync_playwright() as p:
+            launcher = getattr(p, browser)
             try:
-                browser = p.chromium.launch(headless=True)
+                browser_obj = launcher.launch(headless=True)
             except PlaywrightError as exc:
                 msg = str(exc).lower()
                 if "executable doesn" in msg or "browsertype.launch" in msg:
-                    raise ChromiumNotInstalledError(
-                        "Chromium browser binary not found. Run "
-                        "`uv run playwright install chromium` (one-time, ~150MB)."
-                    ) from exc
-                raise RouteUnreachableError(f"Failed to launch Chromium: {exc}") from exc
+                    if browser == "chromium":
+                        raise ChromiumNotInstalledError(
+                            "Chromium browser binary not found. Run "
+                            "`uv run playwright install chromium` (one-time, ~150MB)."
+                        ) from exc
+                    raise BrowserNotInstalledError(browser, exc) from exc
+                raise RouteUnreachableError(f"Failed to launch {browser}: {exc}") from exc
 
             try:
-                context = browser.new_context(
+                context = browser_obj.new_context(
                     viewport={"width": viewport[0], "height": viewport[1]}
                 )
                 page = context.new_page()
@@ -440,7 +481,7 @@ def measure_render(
                     },
                 )
             finally:
-                browser.close()
+                browser_obj.close()
     except RenderError:
         raise
     except Exception as exc:  # unexpected — wrap so callers get a stable type
@@ -463,13 +504,19 @@ def capture_screenshot(
     wait_for: str | None = None,
     full_page: bool = True,
     timeout_ms: int = 15_000,
+    browser: BrowserName = "chromium",
 ) -> bytes:
     """Capture a PNG screenshot of ``route`` at ``viewport`` using Playwright.
 
     Pure adjacency to :func:`measure_render` — same dependency chain, same
     error hierarchy. Returns raw PNG bytes; the caller decides how to persist
-    them.
+    them. ``browser`` selects the Playwright engine (chromium / firefox /
+    webkit); defaults to chromium for full backward compatibility.
     """
+    if browser not in _VALID_BROWSERS:
+        raise RenderError(
+            f"Unsupported browser {browser!r}. Choose one of: {sorted(_VALID_BROWSERS)}."
+        )
     try:
         from playwright.sync_api import (  # noqa: PLC0415
             Error as PlaywrightError,
@@ -482,25 +529,27 @@ def capture_screenshot(
         )
     except ImportError as exc:
         raise PlaywrightNotInstalledError(
-            "playwright is not installed. Run `uv sync` then "
-            "`uv run playwright install chromium`."
+            "playwright is not installed. Run `uv sync` then `uv run playwright install chromium`."
         ) from exc
 
     try:
         with sync_playwright() as p:
+            launcher = getattr(p, browser)
             try:
-                browser = p.chromium.launch(headless=True)
+                browser_obj = launcher.launch(headless=True)
             except PlaywrightError as exc:
                 msg = str(exc).lower()
                 if "executable doesn" in msg or "browsertype.launch" in msg:
-                    raise ChromiumNotInstalledError(
-                        "Chromium browser binary not found. Run "
-                        "`uv run playwright install chromium` (one-time, ~150MB)."
-                    ) from exc
-                raise RouteUnreachableError(f"Failed to launch Chromium: {exc}") from exc
+                    if browser == "chromium":
+                        raise ChromiumNotInstalledError(
+                            "Chromium browser binary not found. Run "
+                            "`uv run playwright install chromium` (one-time, ~150MB)."
+                        ) from exc
+                    raise BrowserNotInstalledError(browser, exc) from exc
+                raise RouteUnreachableError(f"Failed to launch {browser}: {exc}") from exc
 
             try:
-                context = browser.new_context(
+                context = browser_obj.new_context(
                     viewport={"width": viewport[0], "height": viewport[1]}
                 )
                 page = context.new_page()
@@ -530,7 +579,7 @@ def capture_screenshot(
 
                 png_bytes: bytes = page.screenshot(full_page=full_page)
             finally:
-                browser.close()
+                browser_obj.close()
     except RenderError:
         raise
     except Exception as exc:
@@ -543,6 +592,8 @@ __all__ = [
     "MAX_ELEMENTS",
     "MIN_AREA_PX2",
     "BoundingBox",
+    "BrowserName",
+    "BrowserNotInstalledError",
     "ChromiumNotInstalledError",
     "ComputedStyle",
     "MeasuredDOM",

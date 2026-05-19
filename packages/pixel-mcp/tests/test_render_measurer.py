@@ -149,3 +149,122 @@ def test_measure_hidden_elements_filtered(fixture_server: tuple[str, HTTPServer]
 def test_measure_caps_at_max_elements() -> None:
     """Sanity: MAX_ELEMENTS is the published cap, used by the cmd layer."""
     assert MAX_ELEMENTS == 200
+
+
+# ---------------------------------------------------------------------------
+# v2-2 — cross-browser plumbing (mocked Playwright; no real engines launched)
+# ---------------------------------------------------------------------------
+
+
+class _FakeBrowser:
+    """Stand-in for the Playwright Browser object used in measure_render."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def new_context(self, **_kwargs: object) -> _FakeContext:
+        return _FakeContext()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeContext:
+    def new_page(self) -> _FakePage:
+        return _FakePage()
+
+
+class _FakePage:
+    def goto(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def wait_for_selector(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def wait_for_load_state(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def evaluate(self, _js: object, *_args: object, **_kwargs: object) -> dict:
+        return {"elements": [], "truncated": False, "total_found": 0}
+
+    def screenshot(self, **_kwargs: object) -> bytes:
+        return b"fake-png"
+
+
+class _FakeLauncher:
+    def __init__(self, name: str, calls: list[str]) -> None:
+        self.name = name
+        self.calls = calls
+
+    def launch(self, **_kwargs: object) -> _FakeBrowser:
+        self.calls.append(self.name)
+        return _FakeBrowser()
+
+
+class _FakePlaywright:
+    def __init__(self, calls: list[str]) -> None:
+        self.chromium = _FakeLauncher("chromium", calls)
+        self.firefox = _FakeLauncher("firefox", calls)
+        self.webkit = _FakeLauncher("webkit", calls)
+
+
+class _FakePlaywrightContextManager:
+    def __init__(self, pw: _FakePlaywright) -> None:
+        self._pw = pw
+
+    def __enter__(self) -> _FakePlaywright:
+        return self._pw
+
+    def __exit__(self, *_a: object) -> None:
+        return None
+
+
+def test_measure_browser_param_routes_to_firefox(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``browser='firefox'`` reaches ``p.firefox.launch(...)``."""
+    import playwright.sync_api  # noqa: PLC0415
+
+    calls: list[str] = []
+    fake = _FakePlaywright(calls)
+
+    def _fake_sync_playwright() -> _FakePlaywrightContextManager:
+        return _FakePlaywrightContextManager(fake)
+
+    monkeypatch.setattr(playwright.sync_api, "sync_playwright", _fake_sync_playwright)
+    dom, _trunc = measure_render(
+        "http://example.invalid/",
+        viewport=(800, 600),
+        wait_for_network_idle=False,
+        browser="firefox",
+    )
+    assert calls == ["firefox"]
+    assert dom.viewport == (800, 600)
+
+
+def test_measure_browser_default_is_chromium(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitting ``browser`` still launches chromium (backward compat)."""
+    import playwright.sync_api  # noqa: PLC0415
+
+    calls: list[str] = []
+    fake = _FakePlaywright(calls)
+
+    def _fake_sync_playwright() -> _FakePlaywrightContextManager:
+        return _FakePlaywrightContextManager(fake)
+
+    monkeypatch.setattr(playwright.sync_api, "sync_playwright", _fake_sync_playwright)
+    measure_render(
+        "http://example.invalid/",
+        wait_for_network_idle=False,
+    )
+    assert calls == ["chromium"]
+
+
+def test_measure_browser_invalid_raises() -> None:
+    """An unsupported browser name fails loud before touching Playwright."""
+    from pixel_mcp.render import RenderError
+
+    with pytest.raises(RenderError):
+        measure_render(
+            "http://example.invalid/",
+            wait_for_network_idle=False,
+            browser="opera",  # type: ignore[arg-type]
+        )
