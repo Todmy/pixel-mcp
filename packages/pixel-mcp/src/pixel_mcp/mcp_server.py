@@ -140,8 +140,9 @@ def judge(
 
 @server.tool()
 def check(
-    figma_url: str,
     route: str,
+    figma_url: str | None = None,
+    image_path: str | None = None,
     viewport_width: int = 1280,
     viewport_height: int = 720,
     selectors: list[str] | None = None,
@@ -149,22 +150,31 @@ def check(
     refresh_spec: bool = False,
     treat_minor_as_blocking: bool = False,
 ) -> dict[str, Any]:
-    """One Iteration of the Convergence Loop — spec + measure + diff + judge.
+    """One Iteration of the Convergence Loop.
+
+    Figma mode (pass ``figma_url``): spec + measure + diff + judge + visual signals.
+    Image-only mode (pass ``image_path``): measure + visual signals
+    (SSIM + Hot Regions). Exactly one of ``figma_url`` or ``image_path`` must
+    be provided — they are mutually exclusive.
 
     Args:
-        figma_url: Figma Frame / Component Instance / Master Component URL.
         route: URL of the Render (e.g. http://localhost:3000/foo).
+        figma_url: Figma Frame / Component Instance / Master Component URL.
+            Mutually exclusive with ``image_path``.
+        image_path: Filesystem path to a static design image (PNG/JPG).
+            Mutually exclusive with ``figma_url``.
         viewport_width: Browser viewport width in CSS px. Default 1280.
         viewport_height: Browser viewport height. Default 720.
         selectors: Optional CSS selectors to limit measurement.
         wait_for: Optional CSS selector to wait for before measuring.
-        refresh_spec: Bypass the DesignSpec cache.
+        refresh_spec: Bypass the DesignSpec cache (Figma mode only).
         treat_minor_as_blocking: Strict Tolerance — minor Deltas block.
 
-    Returns the AXI envelope wrapping ``{converged, deltas, judgment, ...}``.
+    Returns the AXI envelope wrapping ``{mode, converged, deltas, judgment, ...}``.
     """
     envelope, _exit_code = check_cmd_mod.run(
         figma_url=figma_url,
+        image_path=image_path,
         route=route,
         viewport=(viewport_width, viewport_height),
         selectors=selectors,

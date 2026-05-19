@@ -242,10 +242,17 @@ def judge(
 
 @app.command()
 def check(
-    figma: str = typer.Option(  # noqa: B008
-        ...,
+    figma: Optional[str] = typer.Option(  # noqa: B008, UP007
+        None,
         "--figma",
-        help="Figma URL — Frame, Component Instance, or Master Component.",
+        help="Figma URL — Frame, Component Instance, or Master Component. "
+        "Mutually exclusive with --image.",
+    ),
+    image: Optional[Path] = typer.Option(  # noqa: B008, UP007
+        None,
+        "--image",
+        help="Path to a static design image (PNG/JPG) — image-only mode. "
+        "Mutually exclusive with --figma.",
     ),
     route: str = typer.Option(  # noqa: B008
         ...,
@@ -270,7 +277,7 @@ def check(
     refresh_spec: bool = typer.Option(  # noqa: B008
         False,
         "--refresh-spec",
-        help="Bypass the spec-cache and re-fetch from the Figma API.",
+        help="Bypass the spec-cache and re-fetch from the Figma API (Figma mode only).",
     ),
     strict: bool = typer.Option(  # noqa: B008
         False,
@@ -283,9 +290,15 @@ def check(
         help="Write the AXI envelope JSON to this file. Defaults to stdout.",
     ),
 ) -> None:
-    """One Iteration of the Convergence Loop — spec + measure + diff + judge."""
+    """One Iteration of the Convergence Loop.
+
+    Figma mode (``--figma``): spec + measure + diff + judge with visual signals.
+    Image-only mode (``--image``): measure + visual signals (SSIM + Hot Regions).
+    Exactly one of ``--figma`` or ``--image`` must be provided.
+    """
     envelope, exit_code = check_cmd_mod.run(
         figma_url=figma,
+        image_path=image,
         route=route,
         viewport=_parse_viewport(viewport),
         selectors=_parse_selectors(selectors),

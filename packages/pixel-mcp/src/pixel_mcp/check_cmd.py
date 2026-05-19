@@ -1,25 +1,40 @@
 """Composite ``pixel-mcp check`` — one Iteration of the Convergence Loop.
 
-Runs ``spec`` + ``measure`` + ``diff`` + ``judge`` end-to-end and returns a
-single AXI envelope. This is the command Ralph Loop / any Loop Runner
-invokes in its inner body.
+Runs ``spec`` + ``measure`` + ``diff`` + ``judge`` end-to-end (Figma mode) or
+``measure`` + visual diff + Hot Region attribution (image-only mode), and
+returns a single AXI envelope. This is the command Ralph Loop / any Loop
+Runner invokes in its inner body.
+
+Modes
+-----
+
+- **Figma mode** — ``--figma <url> --route <url>`` (the original v0 path).
+  Extracts a DesignSpec, runs DeltaDiffer + ConvergenceJudge, then layers
+  Level 0 visual signals (SSIM + Hot Regions) on top.
+
+- **Image-only mode** (v0.5-1) — ``--image <path> --route <url>``. For users
+  without Figma. Skips DesignSpec extraction entirely; convergence is
+  driven purely by Level 0 visual signals (``ssim_score >= ssim_threshold``
+  AND zero Hot Regions ``>= min_bbox_area``). Hot Regions still feed
+  through ``decompose_hot_regions`` for DOM attribution. Pseudo-Deltas are
+  synthesized from Hot Regions so loop economics (stuck / regression /
+  history) continue to work unchanged.
 
 Exit codes (per [PRD #10](https://github.com/Todmy/PBaaS/issues/10)):
+
 - 0 — Final Convergence at the highest currently-enabled Level.
 - 1 — Deltas present; loop continues.
 - 2 — Ready for Level 3 (Slice #19+; reserved here).
-- 3 — Regression detected (Slice #19+; reserved).
-- 12 — Fatal (Figma/Render/IO error).
-
-v0 scope: Level 0 with naïve DeltaDiffer only. SSIM Score and Hot Regions
-arrive in Slice #6; Normalizer in Slice #5; Hierarchical decomposition in
-Slice #7. The envelope leaves placeholders (``ssim_score: null``,
-``hot_regions: []``) so the schema is stable across slices.
+- 3 — Regression detected.
+- 10 — Max iterations exceeded.
+- 11 — Stuck (same delta hash N times in a row).
+- 12 — Fatal (Figma/Render/IO/CLI error).
 """
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from pixel_tools_shared import Envelope, make_envelope
@@ -64,8 +79,8 @@ EXIT_FATAL = 12
 
 
 def run(
-    figma_url: str,
-    route: str,
+    figma_url: str | None = None,
+    route: str = "",
     viewport: tuple[int, int] = (1280, 720),
     selectors: list[str] | None = None,
     wait_for: str | None = None,
@@ -73,14 +88,41 @@ def run(
     treat_minor_as_blocking: bool = False,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     stuck_threshold: int = DEFAULT_STUCK_THRESHOLD,
+    image_path: str | Path | None = None,
 ) -> tuple[Envelope, int]:
     """Run one Iteration of the Convergence Loop.
+
+    Exactly one of ``figma_url`` or ``image_path`` must be provided. Both or
+    neither returns an EXIT_FATAL envelope.
 
     Never raises — all errors are folded into the AXI envelope. Loop
     economics (iteration counter, stuck detection, regression, max-iter)
     are enforced via ``.pixel-mcp/state.json``.
     """
-    # --- 0) Iteration counter + max-iter pre-check ---
+    # --- 0a) Validate Design Source selection ---
+    if figma_url and image_path:
+        return _fatal_envelope(
+            "design_source_conflict",
+            "Both --figma and --image were provided. Pick exactly one Design Source.",
+            [
+                "Use --figma <url> for Figma mode.",
+                "Use --image <path> for image-only mode.",
+            ],
+        ), EXIT_FATAL
+    if not figma_url and not image_path:
+        return _fatal_envelope(
+            "design_source_missing",
+            "No Design Source provided. Pass --figma <url> or --image <path>.",
+            [
+                "Figma mode: pass --figma figma.com/design/<id>?node-id=<node>.",
+                "Image-only mode: pass --image path/to/design.png.",
+            ],
+        ), EXIT_FATAL
+
+    image_only = image_path is not None
+    mode = "image" if image_only else "figma"
+
+    # --- 0b) Iteration counter + max-iter pre-check ---
     state = read_state()
     state.iteration += 1
     state.last_invocation_at = now_utc()
@@ -94,39 +136,61 @@ def run(
                 f"Or increase --max-iterations (current {max_iterations}).",
             ],
         ), EXIT_MAX_ITERATIONS
-    # --- 1) Extract DesignSpec ---
-    try:
-        spec = extract_spec(figma_url, refresh=refresh_spec)
-    except FigmaUrlError as exc:
-        return _fatal_envelope(
-            "figma_url_error",
-            str(exc),
-            ["Pass a Figma URL of the form figma.com/design/<id>?node-id=<node>."],
-        ), EXIT_FATAL
-    except FigmaAuthError as exc:
-        return _fatal_envelope(
-            "figma_auth_error",
-            str(exc),
-            ["Set FIGMA_TOKEN to a valid personal-access token."],
-        ), EXIT_FATAL
-    except FigmaNotFoundError as exc:
-        return _fatal_envelope(
-            "figma_not_found",
-            str(exc),
-            ["Check the file-id and node-id — the node may have been deleted."],
-        ), EXIT_FATAL
-    except UnsupportedNodeTypeError as exc:
-        return _fatal_envelope(
-            "unsupported_node_type",
-            str(exc),
-            ["Use a Figma Frame, Component Instance, or Master Component."],
-        ), EXIT_FATAL
-    except (FigmaApiError, FigmaError) as exc:
-        return _fatal_envelope(
-            "figma_error",
-            str(exc),
-            ["See `pixel-mcp doctor` for environment diagnostics."],
-        ), EXIT_FATAL
+
+    # --- 0c) Image-only Design Source pre-validation ---
+    image_bytes: bytes | None = None
+    if image_only:
+        path_obj = Path(image_path)  # type: ignore[arg-type]
+        if not path_obj.exists():
+            return _fatal_envelope(
+                "image_not_found",
+                f"--image path does not exist: {path_obj}",
+                ["Pass a path to a real PNG or JPG file."],
+            ), EXIT_FATAL
+        try:
+            image_bytes = path_obj.read_bytes()
+        except OSError as exc:
+            return _fatal_envelope(
+                "image_read_error",
+                f"Failed to read --image {path_obj}: {exc}",
+                ["Check file permissions and that it's a regular file."],
+            ), EXIT_FATAL
+
+    # --- 1) Extract DesignSpec (Figma mode only) ---
+    spec: DesignSpec | None = None
+    if not image_only:
+        try:
+            spec = extract_spec(figma_url, refresh=refresh_spec)  # type: ignore[arg-type]
+        except FigmaUrlError as exc:
+            return _fatal_envelope(
+                "figma_url_error",
+                str(exc),
+                ["Pass a Figma URL of the form figma.com/design/<id>?node-id=<node>."],
+            ), EXIT_FATAL
+        except FigmaAuthError as exc:
+            return _fatal_envelope(
+                "figma_auth_error",
+                str(exc),
+                ["Set FIGMA_TOKEN to a valid personal-access token."],
+            ), EXIT_FATAL
+        except FigmaNotFoundError as exc:
+            return _fatal_envelope(
+                "figma_not_found",
+                str(exc),
+                ["Check the file-id and node-id — the node may have been deleted."],
+            ), EXIT_FATAL
+        except UnsupportedNodeTypeError as exc:
+            return _fatal_envelope(
+                "unsupported_node_type",
+                str(exc),
+                ["Use a Figma Frame, Component Instance, or Master Component."],
+            ), EXIT_FATAL
+        except (FigmaApiError, FigmaError) as exc:
+            return _fatal_envelope(
+                "figma_error",
+                str(exc),
+                ["See `pixel-mcp doctor` for environment diagnostics."],
+            ), EXIT_FATAL
 
     # --- 2) Measure Render ---
     try:
@@ -167,32 +231,75 @@ def run(
             ["See `pixel-mcp doctor` for environment diagnostics."],
         ), EXIT_FATAL
 
-    # --- 3) Normalize spec for viewport, then Diff + Judge ---
-    normalized_spec = normalize_spec_for_viewport(spec, dom.viewport)
-    deltas = diff_design_vs_render(normalized_spec, dom)
-    judgment = judge_deltas(
-        deltas, tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking)
-    )
+    # --- 3) Structured Deltas / Judgment (Figma mode only) ---
+    if not image_only:
+        assert spec is not None
+        normalized_spec = normalize_spec_for_viewport(spec, dom.viewport)
+        deltas = diff_design_vs_render(normalized_spec, dom)
+        judgment = judge_deltas(
+            deltas,
+            tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking),
+        )
+    else:
+        deltas = []
+        judgment = judge_deltas([])  # vacuously converged; visual signals will decide
 
     # --- 4) Level 0 visual signals: SSIM + Hot Regions + decomposition ---
     ssim_score, hot_regions, regions, visual_error = _compute_visual_signals(
         figma_url=figma_url,
+        image_bytes=image_bytes,
         route=route,
         viewport=viewport,
         wait_for=wait_for,
         dom=dom,
     )
 
-    # Combined Level 0 Gate Pass: structured Deltas AND visual signals must hold.
-    # Visual signal is best-effort — if it couldn't be computed (visual_error
-    # set), we don't block on it. When it IS available, it gates strictly.
-    if visual_error is not None:
-        visual_passes = True  # informational fallback
+    # --- 4b) Image-only mode: synthesize pseudo-Deltas from Hot Regions ---
+    # These feed loop economics (stuck / regression / history) so the rest
+    # of the pipeline works unchanged. They also surface in data.deltas so
+    # the Agent sees what's wrong.
+    if image_only:
+        significant = [r for r in hot_regions if r.w * r.h >= MIN_BBOX_AREA]
+        # Build a selector lookup keyed on (x, y, w, h) so we can attach DOM
+        # attribution to each pseudo-Delta.
+        selector_for: dict[tuple[float, float, float, float], str | None] = {}
+        for region_obj in regions:
+            bbox = region_obj.bbox
+            selector_for[(bbox.x, bbox.y, bbox.w, bbox.h)] = region_obj.leaf_selector
+
+        deltas = [
+            _hot_region_to_delta(
+                index=i,
+                bbox=r,
+                selector=selector_for.get((r.x, r.y, r.w, r.h)),
+            )
+            for i, r in enumerate(significant)
+        ]
+        judgment = judge_deltas(
+            deltas,
+            tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking),
+        )
+
+    # Combined Level 0 Gate Pass. Image-only mode ignores the structured
+    # Deltas verdict (there are no real structured Deltas) and gates purely
+    # on visual signals.
+    if visual_error is not None and not image_only:
+        # Figma mode: best-effort visual signal — fall back to structured verdict.
+        visual_passes = True
     else:
-        ssim_ok = ssim_score is None or ssim_score >= SSIM_THRESHOLD
-        regions_ok = not any(r.w * r.h >= MIN_BBOX_AREA for r in hot_regions)
-        visual_passes = ssim_ok and regions_ok
-    overall_converged = judgment.converged and visual_passes
+        if image_only and visual_error is not None:
+            # Image-only: visual signal IS the verdict. Can't pass without it.
+            visual_passes = False
+        else:
+            ssim_ok = ssim_score is None or ssim_score >= SSIM_THRESHOLD
+            regions_ok = not any(r.w * r.h >= MIN_BBOX_AREA for r in hot_regions)
+            visual_passes = ssim_ok and regions_ok
+
+    if image_only:
+        # Convergence is exclusively visual in image-only mode.
+        overall_converged = visual_passes
+    else:
+        overall_converged = judgment.converged and visual_passes
 
     # --- 5) Loop economics: stuck detection + regression + state update ---
     current_hash = hash_deltas_bucketed(deltas)
@@ -210,6 +317,7 @@ def run(
         {
             "iteration": state.iteration,
             "session_id": state.session_id,
+            "mode": mode,
             "delta_count": len(deltas),
             "delta_hash": current_hash,
             "ssim_score": ssim_score,
@@ -235,6 +343,7 @@ def run(
         is_stuck=is_stuck,
         is_regression=is_regression,
         max_iterations=max_iterations,
+        mode=mode,
     )
 
     if is_regression:
@@ -253,9 +362,40 @@ MIN_BBOX_AREA = 100
 """Default minimum Hot Region area in px² (filters anti-aliasing noise)."""
 
 
+def _severity_for_area(area: float) -> str:
+    """Image-only-mode severity from Hot Region area (per CONTEXT.md)."""
+    if area >= 50_000:
+        return "critical"
+    if area >= 1_000:
+        return "major"
+    return "minor"
+
+
+def _hot_region_to_delta(*, index: int, bbox: BoundingBox, selector: str | None) -> Delta:
+    """Synthesize a pseudo-Delta from a Hot Region for image-only mode.
+
+    The Delta is a structured handle on a region of pixel drift — it carries
+    the bbox, the area-derived severity, and the DOM selector when DOM
+    attribution found one. ``property`` is a stable identifier
+    (``hot_region_<n>``) so the loop-economics hash stays stable across
+    Iterations when the Agent doesn't change anything.
+    """
+    area = bbox.w * bbox.h
+    return Delta(
+        selector=selector or f"hot_region_{index + 1}",
+        figma_node_id=None,
+        property=f"hot_region_{index + 1}",
+        observed={"x": bbox.x, "y": bbox.y, "w": bbox.w, "h": bbox.h, "area_px2": area},
+        expected=None,
+        magnitude=area,
+        severity=_severity_for_area(area),  # type: ignore[arg-type]
+    )
+
+
 def _compute_visual_signals(
     *,
-    figma_url: str,
+    figma_url: str | None,
+    image_bytes: bytes | None,
     route: str,
     viewport: tuple[int, int],
     wait_for: str | None,
@@ -263,10 +403,15 @@ def _compute_visual_signals(
 ) -> tuple[float | None, list[BoundingBox], list[Any], str | None]:
     """Best-effort visual diff + decomposition.
 
+    The expected image comes either from Figma (when ``figma_url`` is set)
+    or from a local file (when ``image_bytes`` is set). Exactly one of the
+    two is provided — the caller has already validated mutual exclusion.
+
     Returns ``(ssim, hot_regions, regions, error_message)``. A non-None
-    ``error_message`` means the visual signal could not be computed (e.g.
-    Figma did not return a PNG). The caller falls back to the structured
-    Deltas verdict and emits a hint.
+    ``error_message`` means the visual signal could not be computed. In
+    Figma mode the caller treats this as best-effort and falls back to the
+    structured-Delta verdict; in image-only mode the caller treats it as a
+    hard fail (no other signal exists).
     """
     try:
         # Lazy imports — keep cv2/skimage out of the critical path when
@@ -277,16 +422,22 @@ def _compute_visual_signals(
         from PIL import Image  # noqa: PLC0415
 
         from pixel_mcp.decompose import decompose_hot_regions  # noqa: PLC0415
-        from pixel_mcp.figma_client import FigmaClient  # noqa: PLC0415
-        from pixel_mcp.figma_url import parse_figma_url  # noqa: PLC0415
         from pixel_mcp.hot_regions import (  # noqa: PLC0415
             compute_hot_regions,
             compute_ssim,
         )
 
-        parsed = parse_figma_url(figma_url)
-        with FigmaClient() as client:
-            expected_png = client.fetch_node_png_bytes(parsed.file_id, parsed.node_id)
+        if image_bytes is not None:
+            expected_png = image_bytes
+        else:
+            # Figma path
+            from pixel_mcp.figma_client import FigmaClient  # noqa: PLC0415
+            from pixel_mcp.figma_url import parse_figma_url  # noqa: PLC0415
+
+            parsed = parse_figma_url(figma_url)  # type: ignore[arg-type]
+            with FigmaClient() as client:
+                expected_png = client.fetch_node_png_bytes(parsed.file_id, parsed.node_id)
+
         actual_png = capture_screenshot(route=route, viewport=viewport, wait_for=wait_for)
 
         expected_img = np.array(Image.open(io.BytesIO(expected_png)).convert("RGB"))
@@ -306,14 +457,12 @@ def _compute_visual_signals(
         )
         return ssim, bboxes, regions, None
     except Exception as exc:  # noqa: BLE001
-        # Visual signal is best-effort. Any failure → Gate Pass falls back
-        # to the structured-Delta verdict, and the envelope explains why.
         return None, [], [], str(exc)
 
 
 def _success_envelope(
     *,
-    spec: DesignSpec,
+    spec: DesignSpec | None,
     dom: MeasuredDOM,
     deltas: list[Delta],
     judgment_data: dict[str, Any],
@@ -328,12 +477,14 @@ def _success_envelope(
     is_stuck: bool = False,
     is_regression: bool = False,
     max_iterations: int | None = None,
+    mode: str = "figma",
 ) -> Envelope:
     delta_dicts = [json.loads(d.model_dump_json()) for d in deltas]
     hot_regions = hot_regions or []
     regions = regions or []
     significant_regions = [r for r in hot_regions if r.w * r.h >= MIN_BBOX_AREA]
     data: dict[str, Any] = {
+        "mode": mode,
         "converged": overall_converged
         if overall_converged is not None
         else judgment_data["converged"],
@@ -347,7 +498,7 @@ def _success_envelope(
         "significant_hot_region_count": len(significant_regions),
         "regions": [json.loads(r.model_dump_json()) for r in regions],
         "visual_error": visual_error,
-        "spec_node_id": spec.figma_node_id,
+        "spec_node_id": spec.figma_node_id if spec is not None else None,
         "dom_route": dom.route,
         "dom_element_count": len(dom.elements),
         "iteration": iteration,
@@ -357,7 +508,7 @@ def _success_envelope(
         "is_regression": is_regression,
     }
 
-    hints: list[str] = _build_hints(judgment_data, deltas, truncated)
+    hints: list[str] = _build_hints(judgment_data, deltas, truncated, mode=mode)
     if iteration is not None and max_iterations is not None:
         hints.append(f"Iteration {iteration} of {max_iterations}.")
     if is_stuck:
@@ -382,14 +533,21 @@ def _success_envelope(
             "see data.hot_regions for bboxes."
         )
     if visual_error is not None:
-        hints.append(
-            f"Visual signal unavailable ({visual_error[:120]}). "
-            "Level 0 Gate Pass fell back to structured Deltas only."
-        )
+        if mode == "image":
+            hints.append(
+                f"Visual signal failed in image-only mode ({visual_error[:120]}). "
+                "Image-only mode has no fallback — convergence cannot be reached "
+                "until the visual diff succeeds."
+            )
+        else:
+            hints.append(
+                f"Visual signal unavailable ({visual_error[:120]}). "
+                "Level 0 Gate Pass fell back to structured Deltas only."
+            )
 
     next_action = (
         "Promote to Level 1 (DINOv2 per-crop similarity) once that plugin is enabled."
-        if judgment_data["converged"]
+        if (overall_converged if overall_converged is not None else judgment_data["converged"])
         else "Have the Agent fix the listed Deltas, then re-invoke `mcp__pixel_mcp__check`."
     )
 
@@ -397,6 +555,7 @@ def _success_envelope(
         data=data,
         hints=hints,
         diagnostics={
+            "mode": mode,
             "delta_count": len(deltas),
             "critical_count": judgment_data["critical_count"],
             "major_count": judgment_data["major_count"],
@@ -422,25 +581,36 @@ def _success_envelope(
     )
 
 
-def _build_hints(judgment_data: dict[str, Any], deltas: list[Delta], truncated: bool) -> list[str]:
+def _build_hints(
+    judgment_data: dict[str, Any],
+    deltas: list[Delta],
+    truncated: bool,
+    *,
+    mode: str = "figma",
+) -> list[str]:
     hints: list[str] = [judgment_data["summary"]]
     if not judgment_data["converged"]:
-        # Per-property guidance
-        property_counts: dict[str, int] = {}
-        for d in deltas:
-            if d.severity in ("critical", "major"):
-                property_counts[d.property] = property_counts.get(d.property, 0) + 1
-        if property_counts:
-            top = sorted(property_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]
-            top_props = ", ".join(f"{p} (×{n})" for p, n in top)
-            hints.append(f"Top properties with critical/major Deltas: {top_props}.")
-        # Common-cause nudges
-        if any(d.property == "color" and d.severity == "critical" for d in deltas):
-            hints.append("Color mismatch is typically a missing or wrong design-token import.")
-        if any(d.property == "font_family" and d.severity == "critical" for d in deltas):
-            hints.append(
-                "Font-family mismatch — confirm the font is loaded (link or @font-face) on the Render side."
-            )
+        # Per-property guidance — only meaningful in Figma mode where
+        # `property` is a real CSS-style key. In image-only mode every
+        # pseudo-Delta has a unique `hot_region_<n>` so the histogram is
+        # noise; skip it.
+        if mode == "figma":
+            property_counts: dict[str, int] = {}
+            for d in deltas:
+                if d.severity in ("critical", "major"):
+                    property_counts[d.property] = property_counts.get(d.property, 0) + 1
+            if property_counts:
+                top = sorted(property_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]
+                top_props = ", ".join(f"{p} (×{n})" for p, n in top)
+                hints.append(f"Top properties with critical/major Deltas: {top_props}.")
+            # Common-cause nudges
+            if any(d.property == "color" and d.severity == "critical" for d in deltas):
+                hints.append("Color mismatch is typically a missing or wrong design-token import.")
+            if any(d.property == "font_family" and d.severity == "critical" for d in deltas):
+                hints.append(
+                    "Font-family mismatch — confirm the font is loaded (link or @font-face) "
+                    "on the Render side."
+                )
     if truncated:
         hints.append(
             "Auto-discover hit the 200-element cap — narrow with --selectors for sharper Deltas."
