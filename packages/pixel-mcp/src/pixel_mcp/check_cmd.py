@@ -42,6 +42,7 @@ from pixel_tools_shared import Envelope, make_envelope
 from pixel_mcp.delta import Delta, diff_design_vs_render
 from pixel_mcp.figma_client import FigmaApiError, FigmaAuthError, FigmaError, FigmaNotFoundError
 from pixel_mcp.figma_url import FigmaUrlError
+from pixel_mcp.human_feedback_cmd import mark_consumed, read_feedback
 from pixel_mcp.judge import Tolerance, judge_deltas
 from pixel_mcp.loop_state import (
     DEFAULT_MAX_ITERATIONS,
@@ -95,6 +96,7 @@ def run(
     enable_vlm: bool = False,
     vlm_threshold: float = 0.7,
     vlm_backend: str = "claude",
+    enable_human_gate: bool = False,
 ) -> tuple[Envelope, int]:
     """Run one Iteration of the Convergence Loop.
 
@@ -370,6 +372,61 @@ def run(
                 tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking),
             )
 
+    # --- 4e) Level 3 (Human review) gate, opt-in ---
+    # Final escalation tier. Runs only when (a) --enable-human-gate is set
+    # AND (b) every automated gate currently enabled has Gate-Passed (i.e.
+    # ``overall_converged`` is still True at this point). Three branches:
+    #
+    # - feedback file absent / already consumed → emit EXIT_READY_FOR_LEVEL_3
+    #   with a pointer at the review + human_feedback tools. The loop pauses.
+    # - feedback unconsumed AND verdict=approved → promote to Level 3, mark
+    #   the file consumed, fall through to a converged exit.
+    # - feedback unconsumed AND verdict=rejected → synthesize a critical
+    #   pseudo-Delta with property="human_review" (notes carried as
+    #   `expected`). The Judge re-runs, overall_converged flips, the loop
+    #   re-opens. Different rejection notes hash to different buckets so
+    #   stuck-detection stays accurate.
+    human_verdict: str | None = None
+    human_notes: str | None = None
+    human_gate_pending = False
+    if enable_human_gate and overall_converged:
+        feedback = read_feedback()
+        if feedback is None or feedback.get("consumed", False):
+            human_gate_pending = True
+            human_verdict = "pending"
+        else:
+            verdict = feedback.get("verdict")
+            if verdict == "approved":
+                human_verdict = "approved"
+                level_reached = 3
+                mark_consumed()
+            elif verdict == "rejected":
+                human_verdict = "rejected"
+                human_notes = feedback.get("notes") or ""
+                mark_consumed()
+                deltas = list(deltas) + [
+                    Delta(
+                        selector="<human>",
+                        figma_node_id=None,
+                        property="human_review",
+                        observed="rejected_by_human",
+                        expected=human_notes,
+                        magnitude=None,
+                        severity="critical",
+                    )
+                ]
+                judgment = judge_deltas(
+                    deltas,
+                    tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking),
+                )
+                overall_converged = False
+                # Keep level_reached at whatever the automated gates earned;
+                # the human just blocks promotion to Level 3.
+            else:
+                # Unknown / malformed verdict — treat as pending.
+                human_gate_pending = True
+                human_verdict = "pending"
+
     # --- 5) Loop economics: stuck detection + regression + state update ---
     current_hash = hash_deltas_bucketed(deltas)
     is_stuck = detect_stuck(state.recent_hashes, current_hash, threshold=stuck_threshold)
@@ -423,12 +480,18 @@ def run(
         vlm_backend=vlm_backend if enable_vlm else None,
         vlm_judgments=vlm_judgments,
         vlm_hint=vlm_hint,
+        human_gate_enabled=enable_human_gate,
+        human_verdict=human_verdict,
+        human_notes=human_notes,
+        human_gate_pending=human_gate_pending,
     )
 
     if is_regression:
         return envelope, EXIT_REGRESSION
     if is_stuck:
         return envelope, EXIT_STUCK
+    if human_gate_pending:
+        return envelope, EXIT_READY_FOR_LEVEL_3
     return envelope, (EXIT_CONVERGED if overall_converged else EXIT_DELTAS)
 
 
@@ -755,7 +818,7 @@ def _run_vlm_gate(
 
     pairs = [(exp, act) for _idx, exp, act, _sel in eligible]
     try:
-        verdicts = compute_vlm_judgment_batch(pairs, backend=vlm_backend)  # type: ignore[arg-type]
+        verdicts = compute_vlm_judgment_batch(pairs, backend=vlm_backend)
     except VLMNotInstalledError:
         return {
             "judgments": [],
@@ -868,6 +931,10 @@ def _success_envelope(
     vlm_backend: str | None = None,
     vlm_judgments: list[dict[str, Any]] | None = None,
     vlm_hint: str | None = None,
+    human_gate_enabled: bool = False,
+    human_verdict: str | None = None,
+    human_notes: str | None = None,
+    human_gate_pending: bool = False,
 ) -> Envelope:
     delta_dicts = [json.loads(d.model_dump_json()) for d in deltas]
     hot_regions = hot_regions or []
@@ -903,6 +970,9 @@ def _success_envelope(
         "vlm_threshold": vlm_threshold,
         "vlm_backend": vlm_backend,
         "vlm_judgments": vlm_judgments,
+        "human_gate_enabled": human_gate_enabled,
+        "human_verdict": human_verdict,
+        "human_notes": human_notes,
     }
 
     hints: list[str] = _build_hints(judgment_data, deltas, truncated, mode=mode)
@@ -976,13 +1046,40 @@ def _success_envelope(
     converged_now = (
         overall_converged if overall_converged is not None else judgment_data["converged"]
     )
-    if not converged_now:
+    # Human-gate hints surface near the bottom so the reviewer notices the
+    # ask after the per-level summaries (which are still useful context).
+    if human_gate_enabled and human_gate_pending:
+        hints.append(
+            "Level 3 (human review) is pending — call `mcp__pixel_mcp__review` to see "
+            "the crop pairs inline, then `mcp__pixel_mcp__human_feedback`."
+        )
+    elif human_gate_enabled and human_verdict == "approved":
+        hints.append("Level 3 (human review) APPROVED — Final Convergence reached.")
+    elif human_gate_enabled and human_verdict == "rejected":
+        hints.append(
+            f"Level 3 (human review) REJECTED — notes: {human_notes!s}. "
+            "Loop re-opened with a synthesized human_review Delta."
+        )
+
+    if human_gate_enabled and human_gate_pending:
+        next_action = (
+            "Call `mcp__pixel_mcp__review` to inspect the expected/actual crops inline, "
+            "then `mcp__pixel_mcp__human_feedback` to record the verdict."
+        )
+    elif not converged_now:
         next_action = (
             "Have the Agent fix the listed Deltas, then re-invoke `mcp__pixel_mcp__check`."
         )
+    elif level_reached >= 3:
+        next_action = "Final Convergence at Level 3 (human review). Nothing left to do."
+    elif level_reached >= 2 and human_gate_enabled:
+        next_action = (
+            "Level 2 Gate Pass. Awaiting Level 3 human verdict — call " "`mcp__pixel_mcp__review`."
+        )
     elif level_reached >= 2:
         next_action = (
-            "Level 2 Gate Pass. Level 3 (human review) is the next escalation tier (v1-3+)."
+            "Level 2 Gate Pass. Promote to Level 3 by re-running with "
+            "`--enable-human-gate` and using `mcp__pixel_mcp__review`."
         )
     elif level_reached >= 1:
         next_action = (

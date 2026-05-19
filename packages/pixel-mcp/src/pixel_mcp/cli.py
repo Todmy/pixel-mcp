@@ -18,6 +18,7 @@ from pixel_tools_shared import Envelope
 from pixel_mcp import check_cmd as check_cmd_mod
 from pixel_mcp import diff_cmd as diff_cmd_mod
 from pixel_mcp import doctor as doctor_mod
+from pixel_mcp import human_feedback_cmd as human_feedback_cmd_mod
 from pixel_mcp import judge_cmd as judge_cmd_mod
 from pixel_mcp import mapping_cmd as mapping_cmd_mod
 from pixel_mcp import measure_cmd as measure_cmd_mod
@@ -311,6 +312,12 @@ def check(
         "--vlm-backend",
         help="VLM backend: 'claude' (default) or 'qwen-local' (v1-2 STUB).",
     ),
+    enable_human_gate: bool = typer.Option(  # noqa: B008
+        False,
+        "--enable-human-gate/--no-enable-human-gate",
+        help="Opt in to Level 3 (human review) escalation gate. Runs only "
+        "after the highest enabled automated level passes.",
+    ),
     out: Optional[Path] = typer.Option(  # noqa: B008, UP007
         None,
         "--out",
@@ -337,6 +344,7 @@ def check(
         enable_vlm=enable_vlm,
         vlm_threshold=vlm_threshold,
         vlm_backend=vlm_backend,
+        enable_human_gate=enable_human_gate,
     )
     _emit(envelope, out)
     raise typer.Exit(code=exit_code)
@@ -358,6 +366,31 @@ def review(
 ) -> None:
     """Prepare a Level 3 human review packet from the most recent check."""
     envelope, exit_code = review_cmd_mod.run()
+    _emit(envelope, out)
+    raise typer.Exit(code=exit_code)
+
+
+@app.command("human-feedback")
+def human_feedback(
+    approve: bool = typer.Option(  # noqa: B008
+        False,
+        "--approve",
+        help="Sign off — record Final Convergence at Level 3 on the next check.",
+    ),
+    rejection_notes: Optional[str] = typer.Option(  # noqa: B008, UP007
+        None,
+        "--rejection-notes",
+        help="Reject the review packet and inject the given notes as a "
+        "pseudo-Delta on the next check.",
+    ),
+    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+        None, "--out", help="Write the AXI envelope JSON to this file."
+    ),
+) -> None:
+    """Capture the Level 3 human verdict (approve OR rejection notes)."""
+    envelope, exit_code = human_feedback_cmd_mod.run(
+        approve=approve, rejection_notes=rejection_notes
+    )
     _emit(envelope, out)
     raise typer.Exit(code=exit_code)
 

@@ -17,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 from pixel_mcp import check_cmd as check_cmd_mod
 from pixel_mcp import diff_cmd as diff_cmd_mod
 from pixel_mcp import doctor as doctor_mod
+from pixel_mcp import human_feedback_cmd as human_feedback_cmd_mod
 from pixel_mcp import judge_cmd as judge_cmd_mod
 from pixel_mcp import mapping_cmd as mapping_cmd_mod
 from pixel_mcp import measure_cmd as measure_cmd_mod
@@ -154,6 +155,7 @@ def check(
     enable_vlm: bool = False,
     vlm_threshold: float = 0.7,
     vlm_backend: str = "claude",
+    enable_human_gate: bool = False,
 ) -> dict[str, Any]:
     """One Iteration of the Convergence Loop.
 
@@ -186,6 +188,10 @@ def check(
             (default 0.7).
         vlm_backend: VLM backend — ``claude`` (default) or ``qwen-local``
             (v1-2, currently STUB).
+        enable_human_gate: Opt in to Level 3 (human review) gate. When set,
+            the loop pauses with EXIT_READY_FOR_LEVEL_3 after the highest
+            enabled automated level passes, until ``human_feedback`` records
+            a verdict.
 
     Returns the AXI envelope wrapping ``{mode, converged, deltas, judgment, ...}``.
     """
@@ -203,6 +209,7 @@ def check(
         enable_vlm=enable_vlm,
         vlm_threshold=vlm_threshold,
         vlm_backend=vlm_backend,
+        enable_human_gate=enable_human_gate,
     )
     serialized: dict[str, Any] = json.loads(json.dumps(envelope, default=str))
     return serialized
@@ -258,9 +265,46 @@ def reset(all_artifacts: bool = False) -> dict[str, Any]:
 
 
 @server.tool()
-def review() -> dict[str, Any]:
-    """Prepare a Level 3 review packet from the most recent ``check``."""
-    envelope, _exit_code = review_cmd_mod.run()
+def review() -> list[Any]:
+    """Prepare a Level 3 review packet from the most recent ``check``.
+
+    Returns a mixed-content list: the AXI envelope (serialized to JSON text)
+    PLUS one FastMCP ``Image`` per crop in the latest iter folder so Claude
+    Code renders them inline. The envelope's ``data.crop_pairs`` carries the
+    on-disk paths for fallback inspection. When FastMCP is unavailable (or
+    no crops exist) only the envelope text is returned.
+    """
+    packet = review_cmd_mod.build_packet()
+    envelope_text = json.dumps(packet.envelope, default=str, indent=2)
+    # FastMCP unpacks lists recursively — each Image becomes an
+    # ImageContent block, the string becomes a TextContent block. Order
+    # matters: text first so the envelope context lands above the images
+    # in Claude Code's chat surface.
+    out: list[Any] = [envelope_text, *packet.images]
+    return out
+
+
+@server.tool()
+def human_feedback(
+    approve: bool = False,
+    rejection_notes: str | None = None,
+) -> dict[str, Any]:
+    """Record the Level 3 human verdict.
+
+    Args:
+        approve: Sign off — the next ``check --enable-human-gate`` marks
+            Final Convergence at Level 3.
+        rejection_notes: Reject and inject this exact text as a
+            ``property="human_review"`` critical pseudo-Delta on the next
+            ``check``. Different text → different hash bucket → stuck
+            detection stays accurate across iterations.
+
+    Exactly one of ``approve=True`` or ``rejection_notes="..."`` must be
+    provided.
+    """
+    envelope, _exit_code = human_feedback_cmd_mod.run(
+        approve=approve, rejection_notes=rejection_notes
+    )
     serialized: dict[str, Any] = json.loads(json.dumps(envelope, default=str))
     return serialized
 

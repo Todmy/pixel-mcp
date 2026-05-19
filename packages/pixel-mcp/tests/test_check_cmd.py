@@ -823,3 +823,192 @@ def test_vlm_gate_not_run_when_level1_fails(mocked_pipeline: Any, tmp_path: Path
     assert exit_code == EXIT_DELTAS
     assert envelope["data"]["level_reached"] == 0
     assert fake_vlm.call_count == 0  # the whole point of the test
+
+
+# ---------------------------------------------------------------------------
+# Level 3 (Human review) gate — v1-3
+# ---------------------------------------------------------------------------
+
+
+def _write_feedback(
+    sd: Path, *, verdict: str, notes: str | None = None, consumed: bool = False
+) -> None:
+    """Pre-stage a human-feedback record on disk."""
+    sd.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "verdict": verdict,
+        "notes": notes,
+        "captured_at": "2026-05-19T00:00:00+00:00",
+        "consumed": consumed,
+    }
+    (sd / "human-feedback.json").write_text(json.dumps(payload))
+
+
+def test_human_gate_disabled_skips_review(mocked_pipeline: Any, tmp_path: Path) -> None:
+    """enable_human_gate=False → no feedback file probe, exit 0 immediately."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path)
+
+    with _patch_visual_signals(regions):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+        )
+
+    assert exit_code == EXIT_CONVERGED
+    assert envelope["data"]["human_gate_enabled"] is False
+    assert envelope["data"]["human_verdict"] is None
+    assert envelope["data"]["level_reached"] == 0
+
+
+def test_human_gate_enabled_returns_pending_when_no_feedback(
+    mocked_pipeline: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """enable_human_gate=True with no feedback file → EXIT_READY_FOR_LEVEL_3."""
+    from pixel_mcp.check_cmd import EXIT_READY_FOR_LEVEL_3
+
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path)
+
+    # Isolate state_dir so the test never picks up a real human-feedback.json.
+    sd = tmp_path / ".pixel-mcp"
+    monkeypatch.setattr("pixel_mcp.human_feedback_cmd.state_dir", lambda *_a, **_k: sd)
+
+    with _patch_visual_signals(regions):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_human_gate=True,
+        )
+
+    assert exit_code == EXIT_READY_FOR_LEVEL_3
+    assert envelope["data"]["human_gate_enabled"] is True
+    assert envelope["data"]["human_verdict"] == "pending"
+    # next_suggested_action must point at the review tool.
+    assert envelope["next_suggested_action"] is not None
+    assert "review" in envelope["next_suggested_action"].lower()
+
+
+def test_human_gate_approved_reaches_final_convergence(
+    mocked_pipeline: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-staged approved feedback → exit 0, level_reached=3, file marked consumed."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path)
+
+    sd = tmp_path / ".pixel-mcp"
+    _write_feedback(sd, verdict="approved")
+    monkeypatch.setattr("pixel_mcp.human_feedback_cmd.state_dir", lambda *_a, **_k: sd)
+
+    with _patch_visual_signals(regions):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_human_gate=True,
+        )
+
+    assert exit_code == EXIT_CONVERGED
+    assert envelope["data"]["converged"] is True
+    assert envelope["data"]["level_reached"] == 3
+    assert envelope["data"]["human_verdict"] == "approved"
+    # File flipped to consumed=true so a second invocation treats it as pending.
+    after = json.loads((sd / "human-feedback.json").read_text())
+    assert after["consumed"] is True
+
+
+def test_human_gate_rejected_emits_pseudo_delta(
+    mocked_pipeline: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rejection → critical pseudo-Delta property=human_review, exit 1."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path)
+
+    sd = tmp_path / ".pixel-mcp"
+    notes = "Margin on hero too tight; button colour drift."
+    _write_feedback(sd, verdict="rejected", notes=notes)
+    monkeypatch.setattr("pixel_mcp.human_feedback_cmd.state_dir", lambda *_a, **_k: sd)
+
+    with _patch_visual_signals(regions):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_human_gate=True,
+        )
+
+    assert exit_code == EXIT_DELTAS
+    assert envelope["data"]["converged"] is False
+    assert envelope["data"]["human_verdict"] == "rejected"
+    assert envelope["data"]["human_notes"] == notes
+    human_deltas = [d for d in envelope["data"]["deltas"] if d["property"] == "human_review"]
+    assert len(human_deltas) == 1
+    delta = human_deltas[0]
+    assert delta["severity"] == "critical"
+    assert delta["expected"] == notes
+    # Consumed flipped to true to prevent re-application on the next iteration.
+    after = json.loads((sd / "human-feedback.json").read_text())
+    assert after["consumed"] is True
+
+
+def test_human_gate_consumed_feedback_treated_as_pending(
+    mocked_pipeline: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Already-consumed feedback file → loop pauses again (EXIT_READY_FOR_LEVEL_3)."""
+    from pixel_mcp.check_cmd import EXIT_READY_FOR_LEVEL_3
+
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path)
+
+    sd = tmp_path / ".pixel-mcp"
+    _write_feedback(sd, verdict="approved", consumed=True)
+    monkeypatch.setattr("pixel_mcp.human_feedback_cmd.state_dir", lambda *_a, **_k: sd)
+
+    with _patch_visual_signals(regions):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_human_gate=True,
+        )
+
+    assert exit_code == EXIT_READY_FOR_LEVEL_3
+    assert envelope["data"]["human_verdict"] == "pending"
+    # The approved record was NOT re-applied: level stays below 3.
+    assert envelope["data"]["level_reached"] < 3
+
+
+def test_human_gate_not_run_when_lower_level_fails(
+    mocked_pipeline: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If Level 0 already fails, the human gate must NOT pause the loop."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    # Inject a colour delta so Level 0 (structured) fails immediately.
+    m_measure.return_value = (_dom(bg="#00ff00"), False)
+
+    sd = tmp_path / ".pixel-mcp"
+    _write_feedback(sd, verdict="approved")
+    monkeypatch.setattr("pixel_mcp.human_feedback_cmd.state_dir", lambda *_a, **_k: sd)
+
+    envelope, exit_code = check_run(
+        figma_url="https://figma.com/design/abc?node-id=1-1",
+        route="http://localhost:3000/",
+        enable_human_gate=True,
+    )
+
+    assert exit_code == EXIT_DELTAS
+    # Gate enabled, but verdict not applied because automated gate failed first.
+    assert envelope["data"]["human_gate_enabled"] is True
+    assert envelope["data"]["human_verdict"] is None
+    # Feedback file must NOT have been consumed.
+    after = json.loads((sd / "human-feedback.json").read_text())
+    assert after["consumed"] is False

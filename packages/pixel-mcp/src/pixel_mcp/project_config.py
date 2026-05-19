@@ -61,6 +61,7 @@ class ProjectConfig(BaseModel):
     enable_vlm: bool = False
     vlm_threshold: float = 0.7
     vlm_backend: Literal["claude", "qwen-local"] = "claude"
+    enable_human_gate: bool = False
     viewport: ViewportConfig = Field(default_factory=ViewportConfig)
     mask_regions: list[MaskRegion] = Field(default_factory=list)
     figma_token_env: str = "FIGMA_TOKEN"
