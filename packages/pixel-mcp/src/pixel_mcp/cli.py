@@ -84,7 +84,10 @@ def mcp() -> None:
 
 
 def _stub(verb: str, issue: int) -> None:
-    typer.echo(f"Not yet implemented — see Todmy/PBaaS#{issue}", err=True)
+    typer.echo(
+        f"`pixel-mcp {verb}` not yet implemented — see Todmy/PBaaS#{issue}",
+        err=True,
+    )
     sys.exit(2)
 
 
