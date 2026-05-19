@@ -57,6 +57,13 @@ from pixel_mcp.loop_state import (
     write_state,
 )
 from pixel_mcp.normalize import normalize_spec_for_viewport
+from pixel_mcp.perf_metrics import (
+    PerfBudget,
+    PerfMetrics,
+    PerfMetricsError,
+    collect_perf_metrics,
+    judge_perf_metrics,
+)
 from pixel_mcp.render import (
     VALID_BROWSERS,
     BoundingBox,
@@ -103,6 +110,8 @@ def run(
     omniparser_confidence_threshold: float = 0.3,
     viewports: list[tuple[int, int]] | None = None,
     browsers: list[str] | None = None,
+    enable_perf: bool = False,
+    perf_budget: PerfBudget | None = None,
 ) -> tuple[Envelope, int]:
     """Run one Iteration of the Convergence Loop.
 
@@ -151,6 +160,8 @@ def run(
             omniparser_confidence_threshold=omniparser_confidence_threshold,
             browsers_specified=browsers is not None,
             viewports_specified=viewports is not None,
+            enable_perf=enable_perf,
+            perf_budget=perf_budget,
         )
 
     # --- 0a) Validate Design Source selection ---
@@ -489,6 +500,39 @@ def run(
                 human_gate_pending = True
                 human_verdict = "pending"
 
+    # --- 4f) v3-1 Performance Budgets gate, opt-in ---
+    # Independent of visual convergence — collects Core Web Vitals for the
+    # same (route, viewport, browser) cell. When a budget is supplied any
+    # field exceeding it (>5% over) synthesises a perf Delta with
+    # property=f"perf_{field}". These join the existing delta stream so loop
+    # economics (hash bucket, stuck detection) and the Judge severity counts
+    # both see them — a critical/major perf miss blocks convergence the same
+    # way a critical visual Delta does.
+    perf_metrics_result: PerfMetrics | None = None
+    perf_hint: str | None = None
+    if enable_perf:
+        perf_result = _run_perf_gate(
+            route=route,
+            viewport=viewport,
+            browser="chromium",
+            wait_for=wait_for,
+            perf_budget=perf_budget,
+        )
+        perf_metrics_result = perf_result["metrics"]
+        perf_hint = perf_result["hint"]
+        perf_failing = perf_result["failing_deltas"]
+        if perf_failing:
+            deltas = list(deltas) + perf_failing
+            judgment = judge_deltas(
+                deltas,
+                tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking),
+            )
+            # A critical/major perf miss reverts overall_converged via the Judge;
+            # minor perf Deltas only block when --strict is set, same rules as
+            # visual minor Deltas.
+            if not judgment.converged:
+                overall_converged = False
+
     # --- 5) Loop economics: stuck detection + regression + state update ---
     current_hash = hash_deltas_bucketed(deltas)
     is_stuck = detect_stuck(state.recent_hashes, current_hash, threshold=stuck_threshold)
@@ -549,6 +593,10 @@ def run(
         omniparser_enabled=enable_omniparser,
         omniparser_detections=omniparser_detections,
         omniparser_hint=omniparser_hint,
+        perf_enabled=enable_perf,
+        perf_budget=perf_budget,
+        perf_metrics=[perf_metrics_result] if perf_metrics_result is not None else [],
+        perf_hint=perf_hint,
     )
 
     if is_regression:
@@ -1136,6 +1184,68 @@ def _run_vlm_gate(
     }
 
 
+# --- v3-1 Performance Budgets gate -----------------------------------------
+
+
+def _run_perf_gate(
+    *,
+    route: str,
+    viewport: tuple[int, int],
+    browser: str,
+    wait_for: str | None,
+    perf_budget: PerfBudget | None,
+) -> dict[str, Any]:
+    """Collect Core Web Vitals for ``route`` and judge them against ``perf_budget``.
+
+    Returns a dict with:
+
+    - ``metrics`` — :class:`PerfMetrics` instance, or ``None`` on collection
+      failure (the loop continues gracefully via the ``hint`` channel).
+    - ``failing_deltas`` — pseudo-:class:`Delta`s for budget overages.
+      Empty when no budget was supplied or every measured field was within
+      tolerance.
+    - ``hint`` — optional AXI hint surfaced when collection failed or no
+      budget was provided.
+
+    Implementation contract: NEVER raises. Any underlying
+    :class:`PerfMetricsError` / :class:`RenderError` is folded into the
+    hint channel so a perf failure can't crash the visual pipeline.
+    """
+    try:
+        metrics = collect_perf_metrics(
+            route=route,
+            viewport=viewport,
+            browser=browser,  # type: ignore[arg-type]
+            wait_for=wait_for,
+        )
+    except (PerfMetricsError, RenderError) as exc:
+        return {
+            "metrics": None,
+            "failing_deltas": [],
+            "hint": (
+                f"Perf gate enabled but collection failed ({exc!s}). "
+                "Falling back — visual convergence verdict stands."
+            ),
+        }
+
+    if perf_budget is None:
+        return {
+            "metrics": metrics,
+            "failing_deltas": [],
+            "hint": (
+                "Perf gate enabled but no --perf-budget provided — "
+                "metrics collected for visibility only, no Deltas emitted."
+            ),
+        }
+
+    failing = judge_perf_metrics(metrics, perf_budget)
+    return {
+        "metrics": metrics,
+        "failing_deltas": failing,
+        "hint": None,
+    }
+
+
 def _success_envelope(
     *,
     spec: DesignSpec | None,
@@ -1171,6 +1281,10 @@ def _success_envelope(
     omniparser_enabled: bool = False,
     omniparser_detections: list[Any] | None = None,
     omniparser_hint: str | None = None,
+    perf_enabled: bool = False,
+    perf_budget: PerfBudget | None = None,
+    perf_metrics: list[PerfMetrics] | None = None,
+    perf_hint: str | None = None,
 ) -> Envelope:
     delta_dicts = [json.loads(d.model_dump_json()) for d in deltas]
     hot_regions = hot_regions or []
@@ -1214,6 +1328,11 @@ def _success_envelope(
             [json.loads(d.model_dump_json()) for d in omniparser_detections]
             if omniparser_detections is not None
             else None
+        ),
+        "perf_enabled": perf_enabled,
+        "perf_budget": perf_budget.model_dump() if perf_budget is not None else None,
+        "perf_metrics": (
+            [json.loads(m.model_dump_json()) for m in (perf_metrics or [])] if perf_enabled else []
         ),
     }
 
@@ -1270,6 +1389,15 @@ def _success_envelope(
         hints.append(vlm_hint)
     if omniparser_hint is not None:
         hints.append(omniparser_hint)
+    if perf_hint is not None:
+        hints.append(perf_hint)
+    if perf_enabled and perf_metrics:
+        failing_perf = [d for d in deltas if d.property.startswith("perf_")]
+        if failing_perf:
+            hints.append(
+                f"Performance budget exceeded on {len(failing_perf)} metric(s) — "
+                "see data.perf_metrics + Deltas with property `perf_*`."
+            )
     if omniparser_enabled and omniparser_detections is not None:
         labelled = sum(1 for r in (regions or []) if getattr(r, "semantic_label", None) is not None)
         if labelled > 0:
@@ -1483,6 +1611,8 @@ def _run_one_pass(
     enable_omniparser: bool,
     omniparser_confidence_threshold: float,
     namespace_browser: bool = False,
+    enable_perf: bool = False,
+    perf_budget: PerfBudget | None = None,
 ) -> tuple[dict[str, Any] | None, tuple[Envelope, int] | None]:
     """Run the per-(browser, viewport) pipeline (measure → diff → judge → visual → gates).
 
@@ -1690,6 +1820,29 @@ def _run_one_pass(
                 tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking),
             )
 
+    # --- v3-1 Perf gate (per-cell collection) ---
+    perf_metrics_result: PerfMetrics | None = None
+    perf_hint: str | None = None
+    if enable_perf:
+        perf_result = _run_perf_gate(
+            route=route,
+            viewport=viewport,
+            browser=browser,
+            wait_for=wait_for,
+            perf_budget=perf_budget,
+        )
+        perf_metrics_result = perf_result["metrics"]
+        perf_hint = perf_result["hint"]
+        perf_failing = perf_result["failing_deltas"]
+        if perf_failing:
+            deltas = list(deltas) + perf_failing
+            judgment = judge_deltas(
+                deltas,
+                tolerance=Tolerance(treat_minor_as_blocking=treat_minor_as_blocking),
+            )
+            if not judgment.converged:
+                viewport_converged = False
+
     # Stamp the viewport + browser onto every Delta + Region produced by this pass.
     deltas = _stamp_viewport(deltas, vp_str)
     deltas = _stamp_browser(deltas, browser)
@@ -1725,6 +1878,8 @@ def _run_one_pass(
             "vlm_hint": vlm_hint,
             "omniparser_detections": omniparser_detections,
             "omniparser_hint": omniparser_hint,
+            "perf_metrics": perf_metrics_result,
+            "perf_hint": perf_hint,
         },
         None,
     )
@@ -1753,6 +1908,8 @@ def _run_multi_viewport(
     omniparser_confidence_threshold: float,
     browsers_specified: bool = False,
     viewports_specified: bool = True,
+    enable_perf: bool = False,
+    perf_budget: PerfBudget | None = None,
 ) -> tuple[Envelope, int]:
     """Multi-axis convergence orchestrator (v2-1 viewports × v2-2 browsers).
 
@@ -1908,6 +2065,8 @@ def _run_multi_viewport(
                 enable_omniparser=enable_omniparser,
                 omniparser_confidence_threshold=omniparser_confidence_threshold,
                 namespace_browser=browsers_specified,
+                enable_perf=enable_perf,
+                perf_budget=perf_budget,
             )
             if fatal is not None:
                 # Bubble up the first fatal (matches single-pass semantics).
@@ -2026,6 +2185,8 @@ def _run_multi_viewport(
         human_gate_pending=human_gate_pending,
         omniparser_enabled=enable_omniparser,
         treat_minor_as_blocking=treat_minor_as_blocking,
+        perf_enabled=enable_perf,
+        perf_budget=perf_budget,
     )
 
     if is_regression:
@@ -2066,6 +2227,8 @@ def _success_envelope_multi(
     human_gate_pending: bool,
     omniparser_enabled: bool,
     treat_minor_as_blocking: bool,
+    perf_enabled: bool = False,
+    perf_budget: PerfBudget | None = None,
 ) -> Envelope:
     """Build the AXI envelope for a multi-axis check (v2-1 + v2-2).
 
@@ -2084,6 +2247,7 @@ def _success_envelope_multi(
     aggregated_dinov2: list[dict[str, Any]] = []
     aggregated_vlm: list[dict[str, Any]] = []
     aggregated_omniparser: list[dict[str, Any]] = []
+    aggregated_perf: list[dict[str, Any]] = []
     hints: list[str] = [combined_judgment_data["summary"]]
 
     for pr in pass_results:
@@ -2144,6 +2308,11 @@ def _success_envelope_multi(
             hints.append(f"[{cell_label}] {pr['vlm_hint']}")
         if pr["omniparser_hint"]:
             hints.append(f"[{cell_label}] {pr['omniparser_hint']}")
+        perf_metric_obj = pr.get("perf_metrics")
+        if perf_metric_obj is not None:
+            aggregated_perf.append(json.loads(perf_metric_obj.model_dump_json()))
+        if pr.get("perf_hint"):
+            hints.append(f"[{cell_label}] {pr['perf_hint']}")
 
     data: dict[str, Any] = {
         "mode": mode,
@@ -2174,6 +2343,9 @@ def _success_envelope_multi(
         "human_notes": human_notes,
         "omniparser_enabled": omniparser_enabled,
         "omniparser_detections": (aggregated_omniparser if omniparser_enabled else None),
+        "perf_enabled": perf_enabled,
+        "perf_budget": perf_budget.model_dump() if perf_budget is not None else None,
+        "perf_metrics": aggregated_perf if perf_enabled else [],
     }
     # Surface the axes the caller actually selected. The v2-1 envelope used
     # ``data.viewports`` + ``data.viewport_results``; keep them when the
@@ -2220,6 +2392,13 @@ def _success_envelope_multi(
             "Level 3 (human review) is pending — call `mcp__pixel_mcp__review` to see "
             "the crop pairs inline, then `mcp__pixel_mcp__human_feedback`."
         )
+    if perf_enabled:
+        failing_perf = [d for d in combined_deltas if d.property.startswith("perf_")]
+        if failing_perf:
+            hints.append(
+                f"Performance budget exceeded across the matrix on {len(failing_perf)} "
+                "metric(s) — see data.perf_metrics + Deltas with property `perf_*`."
+            )
 
     if not overall_converged:
         next_action = (

@@ -25,6 +25,7 @@ from pixel_mcp import reset_cmd as reset_cmd_mod
 from pixel_mcp import review_cmd as review_cmd_mod
 from pixel_mcp import snapshot_cmd as snapshot_cmd_mod
 from pixel_mcp import spec_cmd as spec_cmd_mod
+from pixel_mcp.perf_metrics import PerfBudget
 from pixel_mcp.version import __version__
 
 app = typer.Typer(
@@ -223,6 +224,31 @@ def _parse_selectors(raw: str | None) -> list[str] | None:
         return None
     parts = [s.strip() for s in raw.split(",") if s.strip()]
     return parts or None
+
+
+def _parse_perf_budget(raw: str | None) -> PerfBudget | None:
+    """Parse the ``--perf-budget`` JSON string into a :class:`PerfBudget`.
+
+    Returns ``None`` when the caller didn't pass the flag. A malformed JSON
+    payload exits the CLI with a clear, non-traceback error so the Agent
+    sees the problem in the first frame.
+    """
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        typer.echo(
+            f"--perf-budget is not valid JSON: {exc!s}. Example: "
+            '\'{"fcp_ms": 1800, "lcp_ms": 2500, "cls": 0.1}\'',
+            err=True,
+        )
+        raise typer.Exit(code=12) from exc
+    try:
+        return PerfBudget.model_validate(payload)
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"--perf-budget validation failed: {exc!s}", err=True)
+        raise typer.Exit(code=12) from exc
 
 
 @app.command()
@@ -429,6 +455,22 @@ def check(
         "--omniparser-confidence-threshold",
         help="Drop OmniParser detections below this confidence (default 0.3).",
     ),
+    enable_perf: bool = typer.Option(  # noqa: B008
+        False,
+        "--enable-perf/--no-enable-perf",
+        help="Opt in to the v3-1 Performance Budgets gate. Collects Core Web "
+        "Vitals (FCP, LCP, CLS, TTFB, DCL, load) and judges them against "
+        "--perf-budget. Without a budget the metrics are recorded for "
+        "visibility only.",
+    ),
+    perf_budget: str | None = typer.Option(  # noqa: B008, UP007
+        None,
+        "--perf-budget",
+        help="JSON object of performance budgets per metric, e.g. "
+        '\'{"fcp_ms": 1800, "lcp_ms": 2500, "cls": 0.1, "ttfb_ms": 800}\'. '
+        "Each missing field is unbudgeted. Richer config goes through "
+        "`.pixel-mcp.json` later.",
+    ),
     out: Path | None = typer.Option(  # noqa: B008, UP007
         None,
         "--out",
@@ -443,6 +485,7 @@ def check(
     """
     parsed_viewports = _parse_viewports(viewports, viewports_preset)
     parsed_browsers = _parse_browsers(browsers, browsers_preset)
+    parsed_perf_budget = _parse_perf_budget(perf_budget)
     envelope, exit_code = check_cmd_mod.run(
         figma_url=figma,
         image_path=image,
@@ -462,6 +505,8 @@ def check(
         enable_human_gate=enable_human_gate,
         enable_omniparser=enable_omniparser,
         omniparser_confidence_threshold=omniparser_confidence_threshold,
+        enable_perf=enable_perf,
+        perf_budget=parsed_perf_budget,
     )
     _emit(envelope, out)
     raise typer.Exit(code=exit_code)

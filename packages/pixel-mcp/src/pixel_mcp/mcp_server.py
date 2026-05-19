@@ -160,6 +160,8 @@ def check(
     omniparser_confidence_threshold: float = 0.3,
     viewports: list[list[int]] | None = None,
     browsers: list[str] | None = None,
+    enable_perf: bool = False,
+    perf_budget: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """One Iteration of the Convergence Loop.
 
@@ -216,6 +218,9 @@ def check(
     parsed_viewports: list[tuple[int, int]] | None = None
     if viewports is not None:
         parsed_viewports = [(int(v[0]), int(v[1])) for v in viewports]
+    from pixel_mcp.perf_metrics import PerfBudget  # noqa: PLC0415  (lazy)
+
+    parsed_perf_budget = PerfBudget.model_validate(perf_budget) if perf_budget else None
     envelope, _exit_code = check_cmd_mod.run(
         figma_url=figma_url,
         image_path=image_path,
@@ -235,6 +240,8 @@ def check(
         enable_human_gate=enable_human_gate,
         enable_omniparser=enable_omniparser,
         omniparser_confidence_threshold=omniparser_confidence_threshold,
+        enable_perf=enable_perf,
+        perf_budget=parsed_perf_budget,
     )
     serialized: dict[str, Any] = json.loads(json.dumps(envelope, default=str))
     return serialized

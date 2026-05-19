@@ -14,7 +14,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from pixel_mcp.perf_metrics import PerfBudget
+
 __all__ = [
+    "PerfBudget",
     "ProjectConfig",
     "Tolerance",
     "ViewportConfig",
@@ -66,6 +69,8 @@ class ProjectConfig(BaseModel):
     omniparser_confidence_threshold: float = 0.3
     viewport: ViewportConfig = Field(default_factory=ViewportConfig)
     enabled_browsers: list[str] = Field(default_factory=lambda: ["chromium"])
+    enable_perf: bool = False
+    perf_budget: PerfBudget | None = None
     mask_regions: list[MaskRegion] = Field(default_factory=list)
     figma_token_env: str = "FIGMA_TOKEN"
 

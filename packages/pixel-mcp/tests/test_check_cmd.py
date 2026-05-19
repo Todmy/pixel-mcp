@@ -1604,3 +1604,185 @@ def test_browsers_preset_all_expands_to_three(tmp_path: Path, mocked_pipeline: A
     assert m_measure.call_count == 3
     seen_browsers = {call.kwargs.get("browser") for call in m_measure.call_args_list}
     assert seen_browsers == {"chromium", "firefox", "webkit"}
+
+
+# ---------------------------------------------------------------------------
+# v3-1 — Performance Budgets gate
+# ---------------------------------------------------------------------------
+
+
+def _perf_metrics_obj(
+    *,
+    fcp_ms: float | None = 1200.0,
+    lcp_ms: float | None = 2100.0,
+    cls: float | None = 0.05,
+    ttfb_ms: float | None = 350.0,
+    dcl_ms: float | None = 800.0,
+    load_ms: float | None = 2500.0,
+    viewport: tuple[int, int] = (1280, 720),
+    browser: str = "chromium",
+) -> Any:
+    """Build a real PerfMetrics instance for use as a mock return value."""
+    from pixel_mcp.perf_metrics import PerfMetrics
+
+    return PerfMetrics(
+        route="http://localhost:3000/",
+        viewport=viewport,
+        browser=browser,
+        collected_at=datetime.now(UTC),
+        fcp_ms=fcp_ms,
+        lcp_ms=lcp_ms,
+        cls=cls,
+        ttfb_ms=ttfb_ms,
+        dcl_ms=dcl_ms,
+        load_ms=load_ms,
+    )
+
+
+def test_perf_gate_disabled_no_metrics_in_envelope(mocked_pipeline: Any) -> None:
+    """``enable_perf=False`` (default) → no perf_metrics array, perf_enabled=False."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    envelope, exit_code = check_run(
+        figma_url="https://figma.com/design/abc?node-id=1-1",
+        route="http://localhost:3000/",
+    )
+    assert exit_code == EXIT_CONVERGED
+    assert envelope["data"]["perf_enabled"] is False
+    assert envelope["data"]["perf_metrics"] == []
+    assert envelope["data"]["perf_budget"] is None
+
+
+def test_perf_gate_within_budget_no_extra_deltas(mocked_pipeline: Any) -> None:
+    """Mock collector returns within-budget metrics → no perf Deltas."""
+    from pixel_mcp.perf_metrics import PerfBudget
+
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    metrics = _perf_metrics_obj(fcp_ms=1500.0, lcp_ms=2100.0)
+    budget = PerfBudget(fcp_ms=1800.0, lcp_ms=2500.0)
+
+    with patch("pixel_mcp.check_cmd.collect_perf_metrics", return_value=metrics):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_perf=True,
+            perf_budget=budget,
+        )
+
+    assert exit_code == EXIT_CONVERGED
+    assert envelope["data"]["perf_enabled"] is True
+    perf_metrics = envelope["data"]["perf_metrics"]
+    assert isinstance(perf_metrics, list) and len(perf_metrics) == 1
+    assert perf_metrics[0]["fcp_ms"] == 1500.0
+    # No perf Deltas in the delta stream.
+    assert not any(d["property"].startswith("perf_") for d in envelope["data"]["deltas"])
+
+
+def test_perf_gate_over_budget_emits_deltas(mocked_pipeline: Any) -> None:
+    """Mock collector returns over-budget metric → critical Delta on perf_fcp_ms."""
+    from pixel_mcp.perf_metrics import PerfBudget
+
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    # FCP 3000ms vs budget 1800ms (~67% over) → critical
+    metrics = _perf_metrics_obj(fcp_ms=3000.0, lcp_ms=2100.0)
+    budget = PerfBudget(fcp_ms=1800.0, lcp_ms=2500.0)
+
+    with patch("pixel_mcp.check_cmd.collect_perf_metrics", return_value=metrics):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_perf=True,
+            perf_budget=budget,
+        )
+
+    # Critical perf Delta should block convergence.
+    assert exit_code == EXIT_DELTAS
+    assert envelope["data"]["converged"] is False
+    perf_deltas = [d for d in envelope["data"]["deltas"] if d["property"].startswith("perf_")]
+    assert len(perf_deltas) == 1
+    assert perf_deltas[0]["property"] == "perf_fcp_ms"
+    assert perf_deltas[0]["severity"] == "critical"
+
+
+def test_perf_collection_failure_graceful_fallback(mocked_pipeline: Any) -> None:
+    """``collect_perf_metrics`` raising → envelope hint + no crash."""
+    from pixel_mcp.perf_metrics import PerfBudget, PerfMetricsError
+
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    budget = PerfBudget(fcp_ms=1800.0)
+    with patch(
+        "pixel_mcp.check_cmd.collect_perf_metrics",
+        side_effect=PerfMetricsError("evaluate timed out"),
+    ):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_perf=True,
+            perf_budget=budget,
+        )
+
+    # Visual verdict still converged → exit 0; no crash.
+    assert exit_code == EXIT_CONVERGED
+    assert envelope["data"]["perf_enabled"] is True
+    # No metrics collected.
+    assert envelope["data"]["perf_metrics"] == []
+    hints_text = " ".join(envelope["hints"])
+    assert "Perf gate" in hints_text or "perf" in hints_text.lower()
+
+
+def test_perf_per_browser_viewport_cell(mocked_pipeline: Any) -> None:
+    """Multi-viewport × multi-browser → multiple PerfMetrics entries in envelope."""
+    from pixel_mcp.perf_metrics import PerfBudget
+
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    budget = PerfBudget(fcp_ms=1800.0)
+
+    # Collector returns a different PerfMetrics per call so we can verify
+    # each (browser, viewport) cell contributed.
+    collected: list[Any] = []
+
+    def _fake_collect(**kwargs: Any) -> Any:
+        m = _perf_metrics_obj(
+            fcp_ms=1200.0,
+            viewport=kwargs["viewport"],
+            browser=kwargs["browser"],
+        )
+        collected.append(m)
+        return m
+
+    with patch("pixel_mcp.check_cmd.collect_perf_metrics", side_effect=_fake_collect):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            viewports=[(1280, 720), (375, 667)],
+            browsers=["chromium", "firefox"],
+            enable_perf=True,
+            perf_budget=budget,
+        )
+
+    assert exit_code == EXIT_CONVERGED
+    assert envelope["data"]["perf_enabled"] is True
+    perf_metrics = envelope["data"]["perf_metrics"]
+    # 2 viewports × 2 browsers = 4 cells.
+    assert len(perf_metrics) == 4
+    seen = {(m["browser"], tuple(m["viewport"])) for m in perf_metrics}
+    assert seen == {
+        ("chromium", (1280, 720)),
+        ("chromium", (375, 667)),
+        ("firefox", (1280, 720)),
+        ("firefox", (375, 667)),
+    }
