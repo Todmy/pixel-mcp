@@ -156,6 +156,8 @@ def check(
     vlm_threshold: float = 0.7,
     vlm_backend: str = "claude",
     enable_human_gate: bool = False,
+    enable_omniparser: bool = False,
+    omniparser_confidence_threshold: float = 0.3,
 ) -> dict[str, Any]:
     """One Iteration of the Convergence Loop.
 
@@ -192,6 +194,14 @@ def check(
             the loop pauses with EXIT_READY_FOR_LEVEL_3 after the highest
             enabled automated level passes, until ``human_feedback`` records
             a verdict.
+        enable_omniparser: Augment Region attribution with OmniParser semantic
+            labels (button/input/icon/...). When set, each Region whose
+            centre falls inside a detection gets ``semantic_label`` +
+            ``semantic_confidence`` attached, and (if the VLM gate runs)
+            the label is prepended to the VLM prompt as context. Requires
+            ``pixel-mcp-ml --extra omniparser``.
+        omniparser_confidence_threshold: Drop OmniParser detections below
+            this confidence (default 0.3).
 
     Returns the AXI envelope wrapping ``{mode, converged, deltas, judgment, ...}``.
     """
@@ -210,6 +220,8 @@ def check(
         vlm_threshold=vlm_threshold,
         vlm_backend=vlm_backend,
         enable_human_gate=enable_human_gate,
+        enable_omniparser=enable_omniparser,
+        omniparser_confidence_threshold=omniparser_confidence_threshold,
     )
     serialized: dict[str, Any] = json.loads(json.dumps(envelope, default=str))
     return serialized

@@ -212,11 +212,32 @@ def _image_to_base64(path: str | Path) -> tuple[str, str]:
 
 
 def _build_claude_message_content(
-    expected_image: str | Path, actual_image: str | Path
+    expected_image: str | Path,
+    actual_image: str | Path,
+    context_label: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Two image blocks + an instruction block, in expected→actual order."""
+    """Two image blocks + an instruction block, in expected→actual order.
+
+    When ``context_label`` is set (v1.5-2 OmniParser wiring), a short
+    semantic prelude is prepended to the user instruction so the VLM can
+    bias its verdict toward the known element class (button / input /
+    icon / …). Backward compatible: omit ``context_label`` and the prompt
+    is byte-for-byte identical to v1.
+    """
     exp_type, exp_b64 = _image_to_base64(expected_image)
     act_type, act_b64 = _image_to_base64(actual_image)
+    if context_label:
+        instruction = (
+            f"This region appears to be a `{context_label}`. "
+            "Compare the expected and actual versions: "
+            "Image 1 above is the EXPECTED crop. Image 2 is the ACTUAL "
+            "rendered crop. Judge per system instructions."
+        )
+    else:
+        instruction = (
+            "Image 1 above is the EXPECTED crop. Image 2 is the ACTUAL "
+            "rendered crop. Judge per system instructions."
+        )
     return [
         {
             "type": "image",
@@ -228,10 +249,7 @@ def _build_claude_message_content(
         },
         {
             "type": "text",
-            "text": (
-                "Image 1 above is the EXPECTED crop. Image 2 is the ACTUAL "
-                "rendered crop. Judge per system instructions."
-            ),
+            "text": instruction,
         },
     ]
 
@@ -241,6 +259,7 @@ def _claude_judgment(
     actual_image: str | Path,
     model: str | None,
     client: Any | None = None,
+    context_label: str | None = None,
 ) -> VLMJudgment:
     """Single-pair Claude verdict. ``client`` is the reusable Anthropic client.
 
@@ -257,7 +276,9 @@ def _claude_judgment(
         messages=[
             {
                 "role": "user",
-                "content": _build_claude_message_content(expected_image, actual_image),
+                "content": _build_claude_message_content(
+                    expected_image, actual_image, context_label=context_label
+                ),
             }
         ],
     )
@@ -297,25 +318,38 @@ def _ollama_host() -> str:
 
 
 def _build_qwen_messages(
-    expected_image: str | Path, actual_image: str | Path
+    expected_image: str | Path,
+    actual_image: str | Path,
+    context_label: str | None = None,
 ) -> list[dict[str, Any]]:
     """Ollama ``/api/chat`` payload — system + user (with two image b64s).
 
     Ollama accepts multiple base64 images per message via the ``images``
     list; we don't bother sending media types — Ollama sniffs them from
     the bytes. The user text reuses the same expected→actual framing as
-    the Claude path so model prompts stay comparable.
+    the Claude path so model prompts stay comparable. When
+    ``context_label`` is set (v1.5-2 OmniParser wiring) a semantic
+    prelude is prepended so the local model gets the same hint as Claude.
     """
     _, exp_b64 = _image_to_base64(expected_image)
     _, act_b64 = _image_to_base64(actual_image)
+    if context_label:
+        user_text = (
+            f"This region appears to be a `{context_label}`. "
+            "Compare the expected and actual versions: "
+            "Image 1 is the EXPECTED design crop. Image 2 is the "
+            "ACTUAL rendered crop. Judge per system instructions."
+        )
+    else:
+        user_text = (
+            "Image 1 is the EXPECTED design crop. Image 2 is the "
+            "ACTUAL rendered crop. Judge per system instructions."
+        )
     return [
         {"role": "system", "content": _VLM_SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": (
-                "Image 1 is the EXPECTED design crop. Image 2 is the "
-                "ACTUAL rendered crop. Judge per system instructions."
-            ),
+            "content": user_text,
             "images": [exp_b64, act_b64],
         },
     ]
@@ -326,6 +360,7 @@ def _qwen_judgment(
     actual_image: str | Path,
     model: str | None,
     client: Any | None = None,
+    context_label: str | None = None,
 ) -> VLMJudgment:
     """Single-pair Qwen verdict via Ollama ``/api/chat``.
 
@@ -344,7 +379,7 @@ def _qwen_judgment(
     url = f"{host}/api/chat"
     payload = {
         "model": chosen_model,
-        "messages": _build_qwen_messages(expected_image, actual_image),
+        "messages": _build_qwen_messages(expected_image, actual_image, context_label=context_label),
         "stream": False,
     }
 
@@ -401,6 +436,7 @@ def compute_vlm_judgment(
     actual_image: str | Path,
     backend: Backend = "claude",
     model: str | None = None,
+    context_label: str | None = None,
 ) -> VLMJudgment:
     """Ask a vision-language model to judge two crops.
 
@@ -409,11 +445,20 @@ def compute_vlm_judgment(
     :class:`VLMNotInstalledError` if the chosen backend's SDK is missing,
     and :class:`VLMOllamaError` if the Qwen backend can't reach the
     local Ollama daemon.
+
+    ``context_label`` (v1.5-2): optional semantic hint produced by
+    OmniParser (e.g. ``"button"``, ``"input"``). When supplied, the
+    user-side prompt is prefixed with a short sentence pointing the VLM
+    at the element class. Default ``None`` preserves the v1 prompt.
     """
     if backend == "claude":
-        return _claude_judgment(expected_image, actual_image, model=model)
+        return _claude_judgment(
+            expected_image, actual_image, model=model, context_label=context_label
+        )
     if backend == "qwen-local":
-        return _qwen_judgment(expected_image, actual_image, model=model)
+        return _qwen_judgment(
+            expected_image, actual_image, model=model, context_label=context_label
+        )
     raise ValueError(f"Unknown VLM backend: {backend!r}")
 
 
@@ -421,6 +466,7 @@ def compute_vlm_judgment_batch(
     pairs: list[tuple[Path, Path]],
     backend: Backend = "claude",
     model: str | None = None,
+    context_labels: list[str | None] | None = None,
 ) -> list[VLMJudgment]:
     """Batched Level 2 — one backend client construction for N pairs.
 
@@ -428,14 +474,34 @@ def compute_vlm_judgment_batch(
     the response shape we want, so we loop sequentially but reuse one
     client across pairs (skips per-call TLS setup, env re-reads, and
     HTTP connection pool warmup).
+
+    ``context_labels`` (v1.5-2): optional per-pair OmniParser semantic
+    labels, aligned by index with ``pairs``. ``None`` (or a list of
+    ``None``s) preserves v1 behaviour. A length mismatch raises
+    :class:`ValueError` — caller bug, not a runtime fallback.
     """
     if not pairs:
         return []
+    if context_labels is not None and len(context_labels) != len(pairs):
+        raise ValueError(
+            f"context_labels length {len(context_labels)} != pairs length {len(pairs)}"
+        )
+    labels: list[str | None] = (
+        list(context_labels) if context_labels is not None else [None] * len(pairs)
+    )
     if backend == "claude":
         client = _make_anthropic_client()
         out: list[VLMJudgment] = []
-        for expected_image, actual_image in pairs:
-            out.append(_claude_judgment(expected_image, actual_image, model=model, client=client))
+        for (expected_image, actual_image), label in zip(pairs, labels, strict=True):
+            out.append(
+                _claude_judgment(
+                    expected_image,
+                    actual_image,
+                    model=model,
+                    client=client,
+                    context_label=label,
+                )
+            )
         return out
     if backend == "qwen-local":
         try:
@@ -444,9 +510,15 @@ def compute_vlm_judgment_batch(
             raise VLMNotInstalledError("httpx") from exc
         out_q: list[VLMJudgment] = []
         with httpx.Client(timeout=_OLLAMA_TIMEOUT_SECONDS) as client:
-            for expected_image, actual_image in pairs:
+            for (expected_image, actual_image), label in zip(pairs, labels, strict=True):
                 out_q.append(
-                    _qwen_judgment(expected_image, actual_image, model=model, client=client)
+                    _qwen_judgment(
+                        expected_image,
+                        actual_image,
+                        model=model,
+                        client=client,
+                        context_label=label,
+                    )
                 )
         return out_q
     raise ValueError(f"Unknown VLM backend: {backend!r}")

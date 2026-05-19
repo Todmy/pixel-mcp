@@ -97,6 +97,8 @@ def run(
     vlm_threshold: float = 0.7,
     vlm_backend: str = "claude",
     enable_human_gate: bool = False,
+    enable_omniparser: bool = False,
+    omniparser_confidence_threshold: float = 0.3,
 ) -> tuple[Envelope, int]:
     """Run one Iteration of the Convergence Loop.
 
@@ -262,6 +264,22 @@ def run(
         dom=dom,
         iteration=state.iteration,
     )
+
+    # --- 4a) OmniParser augmentation (v1.5-2) ---
+    # Opt-in semantic-label attribution on top of bare bboxes. Runs against
+    # the full actual screenshot persisted by ``_compute_visual_signals``.
+    # Mutates Regions in place — each Region gets ``semantic_label`` and
+    # ``semantic_confidence`` when a detection covers its centre. The
+    # detections themselves are also surfaced on the envelope so the Agent
+    # can correlate failures with the semantic map.
+    omniparser_detections: list[Any] | None = None
+    omniparser_hint: str | None = None
+    if enable_omniparser:
+        omniparser_detections, omniparser_hint = _run_omniparser_augmentation(
+            regions=regions,
+            iteration=state.iteration,
+            confidence_threshold=omniparser_confidence_threshold,
+        )
 
     # --- 4b) Image-only mode: synthesize pseudo-Deltas from Hot Regions ---
     # These feed loop economics (stuck / regression / history) so the rest
@@ -484,6 +502,9 @@ def run(
         human_verdict=human_verdict,
         human_notes=human_notes,
         human_gate_pending=human_gate_pending,
+        omniparser_enabled=enable_omniparser,
+        omniparser_detections=omniparser_detections,
+        omniparser_hint=omniparser_hint,
     )
 
     if is_regression:
@@ -610,6 +631,19 @@ def _compute_visual_signals(
             crops_dir=crops_root,
             iteration=iteration,
         )
+        # Persist the full ``actual`` screenshot per-iteration so the v1.5-2
+        # OmniParser augmentation can run on the page-scale image (not just
+        # per-region crops). Same iter-N folder as the crops keeps the on-disk
+        # layout consistent — review/snapshot tooling already iterates it.
+        try:
+            iter_dir = crops_root / f"iter-{iteration}"
+            iter_dir.mkdir(parents=True, exist_ok=True)
+            actual_path = iter_dir / "actual.png"
+            Image.fromarray(actual_img).save(actual_path)
+        except OSError:
+            # Crop persistence is best-effort — OmniParser step degrades to
+            # a hint instead of crashing the loop.
+            pass
         return ssim, bboxes, regions, None
     except Exception as exc:  # noqa: BLE001
         return None, [], [], str(exc)
@@ -739,6 +773,124 @@ def _run_dinov2_gate(
     }
 
 
+# --- OmniParser augmentation (v1.5-2) ----------------------------------
+
+
+def _bbox_iou(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> float:
+    """Intersection-over-union for ``(x, y, w, h)`` tuples.
+
+    Returns ``0.0`` when either bbox is degenerate or they don't overlap.
+    """
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix1 = max(ax, bx)
+    iy1 = max(ay, by)
+    ix2 = min(ax + aw, bx + bw)
+    iy2 = min(ay + ah, by + bh)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    union = aw * ah + bw * bh - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def _match_detected_to_region(region: Any, detections: list[Any]) -> Any | None:
+    """Pick the best :class:`DetectedElement` for ``region``, if any.
+
+    Strategy:
+
+    1. Filter detections whose bbox contains the Region's centre point.
+    2. Within that filter, return the one with the highest IoU against
+       the Region bbox; ties broken by detection confidence (descending).
+
+    Returns ``None`` when no detection covers the centre — the explicit
+    contract from the v1.5-2 PRD ("if no detection covers the region
+    centre, return None").
+    """
+    rx = region.bbox.x + region.bbox.w / 2.0
+    ry = region.bbox.y + region.bbox.h / 2.0
+    region_bbox = (region.bbox.x, region.bbox.y, region.bbox.w, region.bbox.h)
+    candidates: list[tuple[float, float, Any]] = []  # (iou, confidence, detection)
+    for det in detections:
+        dx, dy, dw, dh = det.bbox
+        if not (dx <= rx <= dx + dw and dy <= ry <= dy + dh):
+            continue
+        iou = _bbox_iou(region_bbox, det.bbox)
+        candidates.append((iou, float(det.confidence), det))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return candidates[0][2]
+
+
+def _run_omniparser_augmentation(
+    *,
+    regions: list[Any],
+    iteration: int,
+    confidence_threshold: float,
+    project_root: Path | None = None,
+) -> tuple[list[Any] | None, str | None]:
+    """Run OmniParser on the persisted actual screenshot and tag Regions.
+
+    Returns ``(detections, hint)``:
+
+    - ``detections`` — full list of :class:`DetectedElement` (model_dump-
+      friendly objects), or ``None`` when no detection ran (missing
+      extras, missing screenshot, runtime failure).
+    - ``hint`` — optional AXI hint surfaced when the gate degraded to
+      bare bboxes (the loop continues either way).
+
+    Mutates ``regions`` in place: each Region whose centre falls inside a
+    detection's bbox gets ``semantic_label`` + ``semantic_confidence``
+    attached. Regions without a matching detection keep ``None`` —
+    backward compatible with the v1 Region contract.
+    """
+    if not regions:
+        return None, None
+
+    actual_path = state_dir(project_root) / "crops" / f"iter-{iteration}" / "actual.png"
+    if not actual_path.exists():
+        return None, (
+            "OmniParser enabled but the actual screenshot was not persisted "
+            "(visual signal may have failed). Falling back to bare bboxes."
+        )
+
+    try:
+        from pixel_mcp_ml import (  # noqa: PLC0415
+            OmniParserNotInstalledError,
+            detect_ui_elements,
+        )
+    except ImportError:
+        return None, (
+            "OmniParser enabled but extras missing — falling back to bare bboxes. "
+            "Install: `uv tool install pixel-mcp-ml --extra omniparser`."
+        )
+
+    try:
+        detections = list(
+            detect_ui_elements(actual_path, confidence_threshold=confidence_threshold)
+        )
+    except OmniParserNotInstalledError:
+        return None, (
+            "OmniParser enabled but extras missing — falling back to bare bboxes. "
+            "Install: `uv tool install pixel-mcp-ml --extra omniparser`."
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None, (f"OmniParser failed at runtime ({exc!s}). Falling back to bare bboxes.")
+
+    for region in regions:
+        match = _match_detected_to_region(region, detections)
+        if match is not None:
+            region.semantic_label = str(match.label)
+            region.semantic_confidence = float(match.confidence)
+    return detections, None
+
+
 # --- Level 2 (VLM) gate -------------------------------------------------
 
 
@@ -777,7 +929,7 @@ def _run_vlm_gate(
     pipeline keeps working when the VLM extras are not installed. A
     missing SDK surfaces as a graceful fallback hint, not a crash.
     """
-    eligible: list[tuple[int, Path, Path, str | None]] = []
+    eligible: list[tuple[int, Path, Path, str | None, str | None]] = []
     for idx, region in enumerate(regions):
         exp = getattr(region, "expected_crop_path", None)
         act = getattr(region, "actual_crop_path", None)
@@ -788,6 +940,7 @@ def _run_vlm_gate(
                     Path(exp),
                     Path(act),
                     getattr(region, "leaf_selector", None),
+                    getattr(region, "semantic_label", None),
                 )
             )
 
@@ -816,12 +969,22 @@ def _run_vlm_gate(
             ),
         }
 
-    pairs = [(exp, act) for _idx, exp, act, _sel in eligible]
+    pairs = [(exp, act) for _idx, exp, act, _sel, _lbl in eligible]
+    context_labels: list[str | None] = [lbl for _idx, _e, _a, _sel, lbl in eligible]
+    has_labels = any(lbl is not None for lbl in context_labels)
     backend_literal: Literal["claude", "qwen-local"] = (
         "qwen-local" if vlm_backend == "qwen-local" else "claude"
     )
     try:
-        verdicts = compute_vlm_judgment_batch(pairs, backend=backend_literal)
+        if has_labels:
+            verdicts = compute_vlm_judgment_batch(
+                pairs, backend=backend_literal, context_labels=context_labels
+            )
+        else:
+            # Backward compat: keep the v1 call shape when no semantic labels
+            # are present. Tests that monkeypatch compute_vlm_judgment_batch
+            # without the new kwarg keep working.
+            verdicts = compute_vlm_judgment_batch(pairs, backend=backend_literal)
     except VLMNotInstalledError:
         return {
             "judgments": [],
@@ -855,7 +1018,7 @@ def _run_vlm_gate(
 
     judgments_out: list[dict[str, Any]] = []
     failing_deltas: list[Delta] = []
-    for (region_idx, _exp, _act, selector), judgment in zip(eligible, verdicts, strict=True):
+    for (region_idx, _exp, _act, selector, _lbl), judgment in zip(eligible, verdicts, strict=True):
         judgments_out.append(
             {
                 "region_index": region_idx,
@@ -938,6 +1101,9 @@ def _success_envelope(
     human_verdict: str | None = None,
     human_notes: str | None = None,
     human_gate_pending: bool = False,
+    omniparser_enabled: bool = False,
+    omniparser_detections: list[Any] | None = None,
+    omniparser_hint: str | None = None,
 ) -> Envelope:
     delta_dicts = [json.loads(d.model_dump_json()) for d in deltas]
     hot_regions = hot_regions or []
@@ -976,6 +1142,12 @@ def _success_envelope(
         "human_gate_enabled": human_gate_enabled,
         "human_verdict": human_verdict,
         "human_notes": human_notes,
+        "omniparser_enabled": omniparser_enabled,
+        "omniparser_detections": (
+            [json.loads(d.model_dump_json()) for d in omniparser_detections]
+            if omniparser_detections is not None
+            else None
+        ),
     }
 
     hints: list[str] = _build_hints(judgment_data, deltas, truncated, mode=mode)
@@ -1029,6 +1201,15 @@ def _success_envelope(
             )
     if vlm_hint is not None:
         hints.append(vlm_hint)
+    if omniparser_hint is not None:
+        hints.append(omniparser_hint)
+    if omniparser_enabled and omniparser_detections is not None:
+        labelled = sum(1 for r in (regions or []) if getattr(r, "semantic_label", None) is not None)
+        if labelled > 0:
+            hints.append(
+                f"OmniParser tagged {labelled} of {len(regions or [])} Region(s) "
+                "with semantic labels — see data.regions[*].semantic_label."
+            )
     if vlm_enabled and vlm_judgments:
         failing_vlm = [
             v

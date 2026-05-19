@@ -392,3 +392,65 @@ def test_unknown_backend_raises_value_error(crop_pair: tuple[Path, Path]) -> Non
     a, b = crop_pair
     with pytest.raises(ValueError):
         compute_vlm_judgment(a, b, backend="gpt-5")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# v1.5-2 — OmniParser semantic-label context wiring
+# ---------------------------------------------------------------------------
+
+
+def test_context_label_prepended_to_claude_user_prompt(
+    monkeypatch: pytest.MonkeyPatch, crop_pair: tuple[Path, Path]
+) -> None:
+    """When ``context_label`` is set, the Claude user prompt mentions the label."""
+    client = _install_fake_anthropic(
+        monkeypatch,
+        json.dumps({"verdict": "match", "confidence": 0.9, "reasoning": "ok"}),
+    )
+    a, b = crop_pair
+    compute_vlm_judgment(a, b, context_label="button")
+
+    kwargs = client.messages.create.call_args.kwargs
+    text_blocks = [
+        block for block in kwargs["messages"][0]["content"] if block.get("type") == "text"
+    ]
+    assert any("button" in block["text"] for block in text_blocks)
+    assert any("This region appears to be a `button`" in block["text"] for block in text_blocks)
+
+
+def test_context_label_omitted_keeps_v1_prompt(
+    monkeypatch: pytest.MonkeyPatch, crop_pair: tuple[Path, Path]
+) -> None:
+    """Default ``context_label=None`` → no semantic prelude in the prompt."""
+    client = _install_fake_anthropic(
+        monkeypatch,
+        json.dumps({"verdict": "match", "confidence": 0.9, "reasoning": "ok"}),
+    )
+    a, b = crop_pair
+    compute_vlm_judgment(a, b)
+
+    kwargs = client.messages.create.call_args.kwargs
+    text_blocks = [
+        block for block in kwargs["messages"][0]["content"] if block.get("type") == "text"
+    ]
+    joined = " ".join(block["text"] for block in text_blocks)
+    assert "This region appears to be" not in joined
+
+
+def test_batch_context_labels_length_mismatch_raises(
+    monkeypatch: pytest.MonkeyPatch, crop_pair: tuple[Path, Path]
+) -> None:
+    """Mismatched ``context_labels`` length → ValueError (caller bug)."""
+    from pixel_mcp_ml import compute_vlm_judgment_batch
+
+    _install_fake_anthropic(
+        monkeypatch,
+        json.dumps({"verdict": "match", "confidence": 0.9, "reasoning": "ok"}),
+    )
+    a, b = crop_pair
+    with pytest.raises(ValueError):
+        compute_vlm_judgment_batch(
+            [(a, b)],
+            backend="claude",
+            context_labels=["button", "input"],  # length 2 != 1
+        )

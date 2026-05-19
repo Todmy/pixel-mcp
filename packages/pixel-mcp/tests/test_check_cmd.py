@@ -1012,3 +1012,278 @@ def test_human_gate_not_run_when_lower_level_fails(
     # Feedback file must NOT have been consumed.
     after = json.loads((sd / "human-feedback.json").read_text())
     assert after["consumed"] is False
+
+
+# ---------------------------------------------------------------------------
+# v1.5-2 — OmniParser semantic-label augmentation
+# ---------------------------------------------------------------------------
+
+
+def _detected_element_obj(
+    bbox: tuple[float, float, float, float],
+    label: str = "button",
+    confidence: float = 0.85,
+) -> Any:
+    """Build a real :class:`DetectedElement` so `.model_dump_json()` works."""
+    from pixel_mcp_ml.omniparser_detect import DetectedElement
+
+    return DetectedElement(
+        bbox=bbox,
+        label=label,  # type: ignore[arg-type]
+        confidence=confidence,
+    )
+
+
+def _seed_actual_screenshot(tmp_path: Path, iteration: int = 1) -> Path:
+    """Pre-place a one-pixel actual.png so OmniParser's existence check passes.
+
+    The actual bytes don't matter — `detect_ui_elements` is monkeypatched.
+    """
+    from PIL import Image
+
+    iter_dir = tmp_path / ".pixel-mcp" / "crops" / f"iter-{iteration}"
+    iter_dir.mkdir(parents=True, exist_ok=True)
+    out = iter_dir / "actual.png"
+    Image.new("RGB", (10, 10), (0, 0, 0)).save(out)
+    return out
+
+
+def _patch_state_dir_to(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route check_cmd's ``state_dir`` lookups at a sandboxed tmp_path."""
+    monkeypatch.setattr(
+        "pixel_mcp.check_cmd.state_dir",
+        lambda *_a, **_k: tmp_path / ".pixel-mcp",
+    )
+
+
+def test_omniparser_disabled_leaves_regions_bare(mocked_pipeline: Any, tmp_path: Path) -> None:
+    """Default (enable_omniparser=False) → Region.semantic_label stays None."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=1)
+
+    with _patch_visual_signals(regions):
+        envelope, _exit = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+        )
+
+    assert envelope["data"]["omniparser_enabled"] is False
+    assert envelope["data"]["omniparser_detections"] is None
+    for r in envelope["data"]["regions"]:
+        assert r["semantic_label"] is None
+        assert r["semantic_confidence"] is None
+
+
+def test_omniparser_enriches_regions_with_labels(
+    mocked_pipeline: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A detection covering a Region's centre → semantic_label attached."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=1)
+    # Region #0 bbox is (0, 0, 10, 10) — centre (5, 5).
+    detections = [_detected_element_obj((0.0, 0.0, 20.0, 20.0), label="button", confidence=0.87)]
+    _patch_state_dir_to(tmp_path, monkeypatch)
+    _seed_actual_screenshot(tmp_path, iteration=1)
+
+    fake_pkg = types.ModuleType("pixel_mcp_ml")
+    fake_pkg.detect_ui_elements = MagicMock(return_value=detections)  # type: ignore[attr-defined]
+    from pixel_mcp_ml.omniparser_detect import OmniParserNotInstalledError
+
+    fake_pkg.OmniParserNotInstalledError = OmniParserNotInstalledError  # type: ignore[attr-defined]
+
+    with (
+        _patch_visual_signals(regions),
+        patch.dict(sys.modules, {"pixel_mcp_ml": fake_pkg}),
+    ):
+        envelope, _exit = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_omniparser=True,
+        )
+
+    assert envelope["data"]["omniparser_enabled"] is True
+    detections_out = envelope["data"]["omniparser_detections"]
+    assert isinstance(detections_out, list) and len(detections_out) == 1
+    assert detections_out[0]["label"] == "button"
+    region_out = envelope["data"]["regions"][0]
+    assert region_out["semantic_label"] == "button"
+    assert region_out["semantic_confidence"] == pytest.approx(0.87)
+
+
+def test_omniparser_no_match_leaves_region_label_none(
+    mocked_pipeline: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Detections that don't overlap any Region centre → semantic_label=None."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=2)
+    # All Region bboxes are (0,0,10,10); detection at (500,500,20,20) misses.
+    detections = [
+        _detected_element_obj((500.0, 500.0, 20.0, 20.0), label="icon", confidence=0.91),
+    ]
+    _patch_state_dir_to(tmp_path, monkeypatch)
+    _seed_actual_screenshot(tmp_path, iteration=1)
+
+    fake_pkg = types.ModuleType("pixel_mcp_ml")
+    fake_pkg.detect_ui_elements = MagicMock(return_value=detections)  # type: ignore[attr-defined]
+    from pixel_mcp_ml.omniparser_detect import OmniParserNotInstalledError
+
+    fake_pkg.OmniParserNotInstalledError = OmniParserNotInstalledError  # type: ignore[attr-defined]
+
+    with (
+        _patch_visual_signals(regions),
+        patch.dict(sys.modules, {"pixel_mcp_ml": fake_pkg}),
+    ):
+        envelope, _exit = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_omniparser=True,
+        )
+
+    assert envelope["data"]["omniparser_enabled"] is True
+    assert envelope["data"]["omniparser_detections"] is not None
+    for r in envelope["data"]["regions"]:
+        assert r["semantic_label"] is None
+        assert r["semantic_confidence"] is None
+
+
+def test_omniparser_graceful_fallback_when_extras_missing(
+    mocked_pipeline: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ImportError on `pixel_mcp_ml` → AXI hint, no crash, no detections."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=1)
+    _patch_state_dir_to(tmp_path, monkeypatch)
+    _seed_actual_screenshot(tmp_path, iteration=1)
+
+    with (
+        _patch_visual_signals(regions),
+        patch.dict(sys.modules, {"pixel_mcp_ml": None}),  # ImportError on import
+    ):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_omniparser=True,
+        )
+
+    assert exit_code == EXIT_CONVERGED  # no crash
+    assert envelope["data"]["omniparser_enabled"] is True
+    assert envelope["data"]["omniparser_detections"] is None
+    hints_text = " ".join(envelope["hints"])
+    assert "OmniParser" in hints_text
+    assert "--extra omniparser" in hints_text
+
+
+def test_vlm_prompt_includes_semantic_label_when_present(
+    mocked_pipeline: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OmniParser-tagged Region → semantic label threads into the VLM prompt.
+
+    Patches `compute_vlm_judgment_batch` to capture the kwargs and asserts
+    the ``context_labels`` keyword carries the expected label string.
+    """
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=1)
+    detections = [_detected_element_obj((0.0, 0.0, 20.0, 20.0), label="button", confidence=0.9)]
+    _patch_state_dir_to(tmp_path, monkeypatch)
+    _seed_actual_screenshot(tmp_path, iteration=1)
+
+    fake_pkg = types.ModuleType("pixel_mcp_ml")
+    fake_pkg.detect_ui_elements = MagicMock(return_value=detections)  # type: ignore[attr-defined]
+    fake_pkg.compute_dinov2_similarity_batch = MagicMock(return_value=[0.99])  # type: ignore[attr-defined]
+    fake_vlm = MagicMock(
+        return_value=[_vlm_judgment_obj(verdict="match", confidence=0.9, reasoning="ok")]
+    )
+    fake_pkg.compute_vlm_judgment_batch = fake_vlm  # type: ignore[attr-defined]
+    from pixel_mcp_ml.omniparser_detect import OmniParserNotInstalledError
+    from pixel_mcp_ml.vlm_verify import VLMNotInstalledError
+
+    fake_pkg.OmniParserNotInstalledError = OmniParserNotInstalledError  # type: ignore[attr-defined]
+    fake_pkg.VLMNotInstalledError = VLMNotInstalledError  # type: ignore[attr-defined]
+
+    with (
+        _patch_visual_signals(regions),
+        patch.dict(sys.modules, {"pixel_mcp_ml": fake_pkg}),
+    ):
+        envelope, _exit = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_omniparser=True,
+            enable_dinov2=True,
+            enable_vlm=True,
+        )
+
+    assert fake_vlm.call_count == 1
+    kwargs = fake_vlm.call_args.kwargs
+    assert "context_labels" in kwargs
+    assert kwargs["context_labels"] == ["button"]
+    # And the region itself made the round-trip with the label attached.
+    region_out = envelope["data"]["regions"][0]
+    assert region_out["semantic_label"] == "button"
+
+
+def test_match_detected_to_region_picks_highest_iou_inside_centre() -> None:
+    """Unit test for the matcher: centre-containment + highest-IoU tie-breaker."""
+    from pixel_mcp.check_cmd import _match_detected_to_region
+    from pixel_mcp.decompose import Region
+    from pixel_mcp.render import BoundingBox
+
+    region = Region(
+        bbox=BoundingBox(x=0, y=0, w=10, h=10),
+        area_px2=100.0,
+        severity="minor",
+    )
+    # Two detections both contain centre (5, 5); the tighter one (higher IoU) wins.
+    big = _detected_element_obj((0.0, 0.0, 100.0, 100.0), label="container", confidence=0.95)
+    tight = _detected_element_obj((0.0, 0.0, 10.0, 10.0), label="button", confidence=0.80)
+    match = _match_detected_to_region(region, [big, tight])
+    assert match is tight  # IoU=1.0 beats IoU≈0.01
+
+    # No detection covers the centre → None.
+    far = _detected_element_obj((500.0, 500.0, 10.0, 10.0), label="icon", confidence=0.99)
+    assert _match_detected_to_region(region, [far]) is None
+
+
+def test_vlm_prompt_unchanged_when_semantic_label_absent(
+    mocked_pipeline: Any, tmp_path: Path
+) -> None:
+    """No OmniParser labels → VLM gate calls the v1 entry-point (no context_labels)."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+    regions = _regions_with_crops(tmp_path, count=1)
+
+    fake_dinov2 = MagicMock(return_value=[0.99])
+    fake_vlm = MagicMock(
+        return_value=[_vlm_judgment_obj(verdict="match", confidence=0.9, reasoning="ok")]
+    )
+    fake_pkg = types.ModuleType("pixel_mcp_ml")
+    fake_pkg.compute_dinov2_similarity_batch = fake_dinov2  # type: ignore[attr-defined]
+    fake_pkg.compute_vlm_judgment_batch = fake_vlm  # type: ignore[attr-defined]
+    from pixel_mcp_ml.vlm_verify import VLMNotInstalledError
+
+    fake_pkg.VLMNotInstalledError = VLMNotInstalledError  # type: ignore[attr-defined]
+
+    with (
+        _patch_visual_signals(regions),
+        patch.dict(sys.modules, {"pixel_mcp_ml": fake_pkg}),
+    ):
+        check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_dinov2=True,
+            enable_vlm=True,
+        )
+
+    # Backward-compat path: no context_labels kwarg passed.
+    assert fake_vlm.call_count == 1
+    assert "context_labels" not in fake_vlm.call_args.kwargs

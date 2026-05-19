@@ -318,6 +318,17 @@ def check(
         help="Opt in to Level 3 (human review) escalation gate. Runs only "
         "after the highest enabled automated level passes.",
     ),
+    enable_omniparser: bool = typer.Option(  # noqa: B008
+        False,
+        "--enable-omniparser/--no-enable-omniparser",
+        help="Augment Region attribution with OmniParser semantic labels "
+        "(button/input/icon/...). Requires `pixel-mcp-ml --extra omniparser`.",
+    ),
+    omniparser_confidence_threshold: float = typer.Option(  # noqa: B008
+        0.3,
+        "--omniparser-confidence-threshold",
+        help="Drop OmniParser detections below this confidence (default 0.3).",
+    ),
     out: Optional[Path] = typer.Option(  # noqa: B008, UP007
         None,
         "--out",
@@ -345,6 +356,8 @@ def check(
         vlm_threshold=vlm_threshold,
         vlm_backend=vlm_backend,
         enable_human_gate=enable_human_gate,
+        enable_omniparser=enable_omniparser,
+        omniparser_confidence_threshold=omniparser_confidence_threshold,
     )
     _emit(envelope, out)
     raise typer.Exit(code=exit_code)

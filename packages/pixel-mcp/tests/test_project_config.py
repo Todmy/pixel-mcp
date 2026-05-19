@@ -73,3 +73,19 @@ def test_vlm_overrides_via_config_file(tmp_path: Path) -> None:
     assert cfg.enable_vlm is True
     assert cfg.vlm_threshold == pytest.approx(0.85)
     assert cfg.vlm_backend == "qwen-local"
+
+
+def test_omniparser_defaults_off() -> None:
+    """OmniParser is opt-in — defaults to disabled, threshold 0.3."""
+    cfg = ProjectConfig()
+    assert cfg.enable_omniparser is False
+    assert cfg.omniparser_confidence_threshold == pytest.approx(0.3)
+
+
+def test_omniparser_overrides_via_config_file(tmp_path: Path) -> None:
+    (tmp_path / ".pixel-mcp.json").write_text(
+        '{"enable_omniparser": true, "omniparser_confidence_threshold": 0.5}'
+    )
+    cfg = load_project_config(project_root=tmp_path)
+    assert cfg.enable_omniparser is True
+    assert cfg.omniparser_confidence_threshold == pytest.approx(0.5)

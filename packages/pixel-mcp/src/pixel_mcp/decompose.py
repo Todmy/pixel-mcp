@@ -33,7 +33,13 @@ Severity = Literal["critical", "major", "minor"]
 
 
 class Region(BaseModel):
-    """One attributed Hot Region — bbox + DOM selector + optional crops."""
+    """One attributed Hot Region — bbox + DOM selector + optional crops.
+
+    ``semantic_label`` and ``semantic_confidence`` are populated by the
+    v1.5-2 OmniParser augmentation in ``check_cmd``. When OmniParser is
+    disabled (or no detection overlaps the region's centre), both stay
+    ``None`` and downstream code preserves the v1 behaviour.
+    """
 
     bbox: BoundingBox
     area_px2: float
@@ -43,6 +49,8 @@ class Region(BaseModel):
     expected_crop_path: str | None = None
     actual_crop_path: str | None = None
     diff_crop_path: str | None = None
+    semantic_label: str | None = None
+    semantic_confidence: float | None = None
 
 
 def decompose_hot_regions(
