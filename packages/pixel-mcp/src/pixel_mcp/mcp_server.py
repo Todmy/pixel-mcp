@@ -20,6 +20,9 @@ from pixel_mcp import doctor as doctor_mod
 from pixel_mcp import judge_cmd as judge_cmd_mod
 from pixel_mcp import mapping_cmd as mapping_cmd_mod
 from pixel_mcp import measure_cmd as measure_cmd_mod
+from pixel_mcp import reset_cmd as reset_cmd_mod
+from pixel_mcp import review_cmd as review_cmd_mod
+from pixel_mcp import snapshot_cmd as snapshot_cmd_mod
 from pixel_mcp import spec_cmd as spec_cmd_mod
 
 server: FastMCP = FastMCP("pixel-mcp")
@@ -195,6 +198,37 @@ def mapping(
         route=route,
         viewport=(viewport_width, viewport_height),
     )
+    serialized: dict[str, Any] = json.loads(json.dumps(envelope, default=str))
+    return serialized
+
+
+@server.tool()
+def snapshot(
+    route: str,
+    tag: str,
+    viewport_width: int = 1280,
+    viewport_height: int = 720,
+) -> dict[str, Any]:
+    """Capture and persist a named Render baseline."""
+    envelope, _exit_code = snapshot_cmd_mod.run(
+        route=route, tag=tag, viewport=(viewport_width, viewport_height)
+    )
+    serialized: dict[str, Any] = json.loads(json.dumps(envelope, default=str))
+    return serialized
+
+
+@server.tool()
+def reset(all_artifacts: bool = False) -> dict[str, Any]:
+    """Clear the State Directory; pass ``all_artifacts=True`` to wipe snapshots too."""
+    envelope, _exit_code = reset_cmd_mod.run(all_artifacts=all_artifacts)
+    serialized: dict[str, Any] = json.loads(json.dumps(envelope, default=str))
+    return serialized
+
+
+@server.tool()
+def review() -> dict[str, Any]:
+    """Prepare a Level 3 review packet from the most recent ``check``."""
+    envelope, _exit_code = review_cmd_mod.run()
     serialized: dict[str, Any] = json.loads(json.dumps(envelope, default=str))
     return serialized
 

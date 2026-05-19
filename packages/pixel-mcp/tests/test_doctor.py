@@ -89,9 +89,9 @@ def test_help_lists_subcommands(runner: CliRunner) -> None:
         assert verb in result.stdout, f"missing {verb} in help output"
 
 
-def test_stub_subcommand_exits_nonzero(runner: CliRunner) -> None:
-    # spec/measure/diff/judge/check (Slices 2-4) and mapping (Slice 8) are now
-    # real. `snapshot` is the next stub (Slice 10).
+def test_no_stub_subcommands_remain(runner: CliRunner) -> None:
+    """All v0 subcommands implemented — invoking them without args should
+    yield a Typer 'missing argument' error (exit 2), not the stub message."""
     result = runner.invoke(app, ["snapshot"])
     assert result.exit_code != 0
-    assert "Todmy/PBaaS#20" in (result.stderr or result.output)
+    assert "Todmy/PBaaS" not in (result.stderr or result.output)

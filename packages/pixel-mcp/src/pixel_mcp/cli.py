@@ -21,6 +21,9 @@ from pixel_mcp import doctor as doctor_mod
 from pixel_mcp import judge_cmd as judge_cmd_mod
 from pixel_mcp import mapping_cmd as mapping_cmd_mod
 from pixel_mcp import measure_cmd as measure_cmd_mod
+from pixel_mcp import reset_cmd as reset_cmd_mod
+from pixel_mcp import review_cmd as review_cmd_mod
+from pixel_mcp import snapshot_cmd as snapshot_cmd_mod
 from pixel_mcp import spec_cmd as spec_cmd_mod
 from pixel_mcp.version import __version__
 
@@ -303,9 +306,15 @@ def _emit(envelope: Envelope, out: Path | None) -> None:
 
 
 @app.command()
-def review() -> None:
-    """Open a human review surface for Level 3. (stub)"""
-    _stub("review", 20)
+def review(
+    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+        None, "--out", help="Write the AXI envelope JSON to this file."
+    ),
+) -> None:
+    """Prepare a Level 3 human review packet from the most recent check."""
+    envelope, exit_code = review_cmd_mod.run()
+    _emit(envelope, out)
+    raise typer.Exit(code=exit_code)
 
 
 @app.command()
@@ -342,15 +351,37 @@ def mapping(
 
 
 @app.command()
-def snapshot() -> None:
-    """Persist a tagged Render baseline. (stub)"""
-    _stub("snapshot", 20)
+def snapshot(
+    route: str = typer.Option(..., "--route", help="URL of the Render."),  # noqa: B008
+    tag: str = typer.Option(..., "--tag", help="Baseline tag name."),  # noqa: B008
+    viewport: str = typer.Option(  # noqa: B008
+        "1280x720", "--viewport", help="Viewport size as WIDTHxHEIGHT."
+    ),
+    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+        None, "--out", help="Write the AXI envelope JSON to this file."
+    ),
+) -> None:
+    """Capture and persist a named Render baseline."""
+    envelope, exit_code = snapshot_cmd_mod.run(
+        route=route, tag=tag, viewport=_parse_viewport(viewport)
+    )
+    _emit(envelope, out)
+    raise typer.Exit(code=exit_code)
 
 
 @app.command()
-def reset() -> None:
-    """Clear the State Directory. (stub)"""
-    _stub("reset", 20)
+def reset(
+    all_artifacts: bool = typer.Option(  # noqa: B008
+        False, "--all", help="Also remove named snapshots."
+    ),
+    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+        None, "--out", help="Write the AXI envelope JSON to this file."
+    ),
+) -> None:
+    """Clear the State Directory (preserve snapshots unless --all)."""
+    envelope, exit_code = reset_cmd_mod.run(all_artifacts=all_artifacts)
+    _emit(envelope, out)
+    raise typer.Exit(code=exit_code)
 
 
 if __name__ == "__main__":
