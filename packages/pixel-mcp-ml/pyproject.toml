@@ -1,12 +1,26 @@
 [project]
 name = "pixel-mcp-ml"
-version = "0.0.1"
-description = "ML extras for pixel-mcp (DINOv2, OmniParser, VLM bridges). Populated in Slices 6+."
+version = "0.1.0"
+description = "ML extras for pixel-mcp — DINOv2 perceptual similarity (Level 1 escalation gate)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Dmytro Tolok" }]
-dependencies = []
+dependencies = [
+    "Pillow>=10.0",
+    "numpy>=1.26",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dinov2 = [
+    "transformers>=4.40",
+    "torch>=2.0",
+    "safetensors>=0.4",
+]
+
+[project.scripts]
+pixel-mcp-ml = "pixel_mcp_ml.cli:app"
 
 [build-system]
 requires = ["hatchling"]

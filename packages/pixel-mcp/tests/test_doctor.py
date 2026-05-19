@@ -35,6 +35,7 @@ def test_doctor_envelope_includes_python_check() -> None:
         "figma_token",
         "httpx",
         "figma_api_reachable",
+        "pixel_mcp_ml",
         "uv",
     } <= names
 
@@ -87,6 +88,63 @@ def test_help_lists_subcommands(runner: CliRunner) -> None:
         "mcp",
     ]:
         assert verb in result.stdout, f"missing {verb} in help output"
+
+
+def test_pixel_mcp_ml_check_green_when_full_stack_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All three specs found -> green status."""
+    import importlib.util
+
+    real_find = importlib.util.find_spec
+
+    def fake_find(name: str, *args: object, **kwargs: object) -> object:
+        if name in ("pixel_mcp_ml", "transformers", "torch"):
+            return object()  # truthy non-None — pretend module exists
+        return real_find(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find)
+    result = doctor_mod._check_pixel_mcp_ml()
+    assert result["status"] == "green"
+
+
+def test_pixel_mcp_ml_check_amber_when_backend_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Package present, ML backend missing -> amber + name in detail."""
+    import importlib.util
+
+    real_find = importlib.util.find_spec
+
+    def fake_find(name: str, *args: object, **kwargs: object) -> object:
+        if name == "pixel_mcp_ml":
+            return object()
+        if name in ("transformers", "torch"):
+            return None
+        return real_find(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find)
+    result = doctor_mod._check_pixel_mcp_ml()
+    assert result["status"] == "amber"
+    assert "transformers" in result["detail"] or "torch" in result["detail"]
+
+
+def test_pixel_mcp_ml_check_red_when_package_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Package absent -> red, no further probing happens."""
+    import importlib.util
+
+    real_find = importlib.util.find_spec
+
+    def fake_find(name: str, *args: object, **kwargs: object) -> object:
+        if name == "pixel_mcp_ml":
+            return None
+        return real_find(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find)
+    result = doctor_mod._check_pixel_mcp_ml()
+    assert result["status"] == "red"
 
 
 def test_no_stub_subcommands_remain(runner: CliRunner) -> None:

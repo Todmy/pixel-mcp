@@ -170,6 +170,45 @@ def _check_figma_api_reachable() -> CheckResult:
         }
 
 
+def _check_pixel_mcp_ml() -> CheckResult:
+    """Plugin check — is ``pixel-mcp-ml`` (Level 1 ML extras) installed?
+
+    Three states:
+
+    - green: package found AND ``transformers`` + ``torch`` both importable.
+    - amber: package found but at least one ML backend missing.
+    - red:   package not found at all.
+
+    We never *import* ``torch``/``transformers`` here — that import alone
+    can take seconds and we don't want doctor to feel sluggish. Existence
+    is probed via ``importlib.util.find_spec``.
+    """
+    if importlib.util.find_spec("pixel_mcp_ml") is None:
+        return {
+            "name": "pixel_mcp_ml",
+            "status": "red",
+            "detail": "pixel-mcp-ml not installed (Level 1 DINOv2 similarity unavailable)",
+        }
+    have_transformers = importlib.util.find_spec("transformers") is not None
+    have_torch = importlib.util.find_spec("torch") is not None
+    if have_transformers and have_torch:
+        return {
+            "name": "pixel_mcp_ml",
+            "status": "green",
+            "detail": "pixel-mcp-ml installed with transformers + torch",
+        }
+    missing = [
+        name
+        for name, present in (("transformers", have_transformers), ("torch", have_torch))
+        if not present
+    ]
+    return {
+        "name": "pixel_mcp_ml",
+        "status": "amber",
+        "detail": f"pixel-mcp-ml installed but ML backend missing: {', '.join(missing)}",
+    }
+
+
 def _check_uv() -> CheckResult:
     path = shutil.which("uv")
     if path:
@@ -193,6 +232,7 @@ def run_checks() -> list[CheckResult]:
         _check_figma_token(),
         _check_httpx(),
         _check_figma_api_reachable(),
+        _check_pixel_mcp_ml(),
         _check_uv(),
     ]
 
@@ -204,6 +244,15 @@ def _summary(checks: list[CheckResult]) -> str:
 
 def _hints_for(checks: list[CheckResult]) -> list[str]:
     hints: list[str] = []
+    # Red hints first — for plugins that are simply not installed yet.
+    for c in checks:
+        if c["status"] != "red":
+            continue
+        if c["name"] == "pixel_mcp_ml":
+            hints.append(
+                "Install pixel-mcp-ml: `uv tool install pixel-mcp-ml` "
+                "(Level 1 DINOv2 similarity gate)."
+            )
     for c in checks:
         if c["status"] != "amber":
             continue
@@ -225,6 +274,11 @@ def _hints_for(checks: list[CheckResult]) -> list[str]:
         elif c["name"] == "figma_api_reachable":
             hints.append(
                 "Check network — api.figma.com unreachable. `pixel-mcp spec` will fail until this clears."
+            )
+        elif c["name"] == "pixel_mcp_ml":
+            hints.append(
+                "Install ML extras: `uv tool install pixel-mcp-ml --extra dinov2` "
+                "(adds transformers + torch for DINOv2)."
             )
     return hints
 
