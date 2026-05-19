@@ -4,17 +4,31 @@ Figma to Browser convergence harness with escalation gates. CLI plus MCP server.
 
 This package is the core, published artifact. See the [repo README](../../README.md) for installation and Claude Code wiring.
 
-## Surface (Slice 2)
+## Surface (Slice 3)
 
 Implemented:
 - `pixel-mcp doctor` — environment Check, returns AXI envelope.
 - `pixel-mcp spec --figma <url>` — extract a DesignSpec from a Figma Source.
-- `pixel-mcp mcp` — launch the MCP server over stdio. Exposes tools: `doctor`, `spec`.
+- `pixel-mcp measure --route <url>` — capture a MeasuredDOM from a Render.
+- `pixel-mcp mcp` — launch the MCP server over stdio. Exposes tools: `doctor`, `spec`, `measure`.
 
 Stubbed (one issue per slice):
-- `measure`, `diff`, `judge`, `check`, `review`, `mapping`, `snapshot`, `reset`.
+- `diff`, `judge`, `check`, `review`, `mapping`, `snapshot`, `reset`.
 
 Each stub prints the tracking issue and exits non-zero.
+
+## Setup — Playwright + Chromium
+
+`measure` drives a headless Chromium browser via Playwright. After
+`uv sync`, install the browser binary once:
+
+```sh
+uv run playwright install chromium
+```
+
+This is a one-time download of roughly 150 MB. `pixel-mcp doctor`
+reports both checks (`playwright` importable, `chromium` binary present)
+and emits the install hint when either is missing.
 
 ## `pixel-mcp spec`
 
@@ -97,3 +111,69 @@ Successful extractions land in `.pixel-mcp/spec-cache.json` keyed by
 `(file_id, node_id)` with a 1-hour TTL. Pass `--refresh-spec` (CLI) or
 `refresh=true` (MCP) to bypass. The cache survives between iterations of
 the Convergence Loop.
+
+## `pixel-mcp measure`
+
+Launches headless Chromium and emits a **MeasuredDOM** — per-element
+bounding boxes, computed styles, text content, ARIA role, parent chain.
+Wrapped in an AXI envelope, ready for the DeltaDiffer (Slice 4) to
+compare against a DesignSpec.
+
+### Usage
+
+```sh
+# Auto-discover visible elements at the default viewport (1280x720)
+pixel-mcp measure --route http://localhost:3000/foo
+
+# Narrow to specific selectors
+pixel-mcp measure --route http://localhost:3000/foo \
+    --selectors "button.cta, nav.top"
+
+# Custom viewport
+pixel-mcp measure --route http://localhost:3000/foo --viewport 1920x1080
+
+# Wait for a selector before measuring (slow-hydrating SPAs)
+pixel-mcp measure --route http://localhost:3000/foo --wait-for ".content-ready"
+
+# Write to a file instead of stdout
+pixel-mcp measure --route http://localhost:3000/foo --out measured.json
+```
+
+The MCP equivalent:
+
+```jsonc
+{
+  "tool": "mcp__pixel_mcp__measure",
+  "args": {
+    "route": "http://localhost:3000/foo",
+    "selectors": ["button.cta"],
+    "viewport_width": 1280,
+    "viewport_height": 720,
+    "wait_for": ".content-ready"
+  }
+}
+```
+
+### Auto-discover
+
+When `--selectors` is omitted, `measure` walks the DOM and picks visible
+elements that are either leaves or semantic containers (`<button>`,
+`<input>`, `<nav>`, `<section>`, `<article>`, `<header>`, `<footer>`, or
+any element with a `role` attribute). Elements smaller than 16 px² are
+filtered out (anti-aliasing noise). The discovery is capped at 200
+elements per route — when the cap is hit the envelope hints to pass
+`--selectors` for a narrower window.
+
+### Determinism
+
+By default `measure` waits for `networkidle` then one
+`requestAnimationFrame` quiet before snapping the page. This gives
+reproducible bounding boxes on most SPAs. Pages with long-poll or SSE
+connections never reach `networkidle`; `measure` continues anyway.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | MeasuredDOM captured successfully. |
+| 12 | Playwright missing, Chromium missing, route unreachable, wait-for timeout, or any other fatal capture error. |

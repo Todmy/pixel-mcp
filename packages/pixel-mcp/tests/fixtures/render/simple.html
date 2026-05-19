@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>pixel-mcp render fixture — simple</title>
+    <style>
+        body {
+            margin: 0;
+            font-family: "Helvetica Neue", Arial, sans-serif;
+            background: #ffffff;
+            color: #111111;
+        }
+        nav.top-nav {
+            background: #1a1a2e;
+            color: #ffffff;
+            padding: 16px 24px;
+        }
+        section.hero {
+            padding: 32px 24px;
+        }
+        section.hero h1 {
+            font-size: 28px;
+            font-weight: 700;
+            margin: 0 0 12px 0;
+        }
+        section.hero p.lede {
+            font-size: 16px;
+            line-height: 24px;
+            margin: 0;
+        }
+        button.cta {
+            background: #007aff;
+            color: #ffffff;
+            border: 0;
+            padding: 12px 24px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 600;
+            margin-top: 16px;
+        }
+        /* a very tiny element to be filtered out */
+        span.tiny-dot {
+            display: inline-block;
+            width: 2px;
+            height: 2px;
+            background: #cccccc;
+        }
+        /* an invisible element */
+        div.hidden-block {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <nav class="top-nav" id="primary-nav">
+        Acme Co
+    </nav>
+    <section class="hero">
+        <h1 id="headline">Ship the pixel-perfect Render</h1>
+        <p class="lede">A deterministic loop between Figma and your browser.</p>
+        <button class="cta" type="button">Get started</button>
+        <span class="tiny-dot"></span>
+    </section>
+    <div class="hidden-block">should not appear</div>
+</body>
+</html>

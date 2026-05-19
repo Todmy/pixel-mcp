@@ -31,6 +31,7 @@ def test_doctor_envelope_includes_python_check() -> None:
     assert {
         "python_version",
         "playwright",
+        "chromium",
         "figma_token",
         "httpx",
         "figma_api_reachable",
@@ -89,7 +90,8 @@ def test_help_lists_subcommands(runner: CliRunner) -> None:
 
 
 def test_stub_subcommand_exits_nonzero(runner: CliRunner) -> None:
-    # `spec` is no longer a stub (Slice 2). Use `measure` (Slice 3, stub) instead.
-    result = runner.invoke(app, ["measure"])
+    # `spec` (Slice 2) and `measure` (Slice 3) are no longer stubs.
+    # `diff` is the next stub (Slice 4).
+    result = runner.invoke(app, ["diff"])
     assert result.exit_code != 0
-    assert "Todmy/PBaaS#13" in (result.stderr or result.output)
+    assert "Todmy/PBaaS#14" in (result.stderr or result.output)

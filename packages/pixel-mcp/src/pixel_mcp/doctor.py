@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import pathlib
 import shutil
 import sys
 from typing import Literal, TypedDict
@@ -58,7 +59,55 @@ def _check_playwright() -> CheckResult:
     return {
         "name": "playwright",
         "status": "amber",
-        "detail": "playwright not installed (needed by Slice 3 — browser MeasuredDOM)",
+        "detail": "playwright not installed (run `uv sync` — required by `pixel-mcp measure`)",
+    }
+
+
+def _check_chromium() -> CheckResult:
+    """Chromium browser binary readiness.
+
+    We avoid launching a browser here — it's slow and racy. Instead we
+    probe the Playwright cache directory for any ``chromium-*`` entry.
+    Mac, Linux, and Windows all use the same ``ms-playwright`` cache
+    layout under platform-specific roots.
+    """
+    if importlib.util.find_spec("playwright") is None:
+        return {
+            "name": "chromium",
+            "status": "amber",
+            "detail": "Skipped — playwright not installed yet",
+        }
+
+    home = pathlib.Path.home()
+    candidate_roots = [
+        home / "Library" / "Caches" / "ms-playwright",  # macOS
+        home / ".cache" / "ms-playwright",  # Linux
+        home / "AppData" / "Local" / "ms-playwright",  # Windows
+    ]
+    env_override = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if env_override:
+        candidate_roots.insert(0, pathlib.Path(env_override))
+
+    for root in candidate_roots:
+        if not root.exists():
+            continue
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            name = entry.name
+            if name.startswith("chromium-") or name.startswith("chromium_headless_shell-"):
+                return {
+                    "name": "chromium",
+                    "status": "green",
+                    "detail": f"chromium binary present at {entry}",
+                }
+
+    return {
+        "name": "chromium",
+        "status": "amber",
+        "detail": "Chromium binary missing (run `uv run playwright install chromium`)",
     }
 
 
@@ -140,6 +189,7 @@ def run_checks() -> list[CheckResult]:
     return [
         _check_python_version(),
         _check_playwright(),
+        _check_chromium(),
         _check_figma_token(),
         _check_httpx(),
         _check_figma_api_reachable(),
@@ -158,8 +208,11 @@ def _hints_for(checks: list[CheckResult]) -> list[str]:
         if c["status"] != "amber":
             continue
         if c["name"] == "playwright":
+            hints.append("Install Playwright: `uv sync` (the dependency is in pyproject.toml).")
+        elif c["name"] == "chromium":
             hints.append(
-                "Install Playwright before Slice 3: `uv pip install playwright && playwright install chromium`"
+                "Install the Chromium browser binary: `uv run playwright install chromium` "
+                "(one-time, ~150MB)."
             )
         elif c["name"] == "figma_token":
             hints.append(
@@ -182,10 +235,10 @@ def _next_action(checks: list[CheckResult]) -> str:
         return f"Resolve red Checks before proceeding: {', '.join(red)}"
     if any(c["status"] == "amber" for c in checks):
         return (
-            "Amber Checks are non-fatal — `pixel-mcp spec` is ready when "
-            "FIGMA_TOKEN is set. Slice 3 (`measure`) needs Playwright."
+            "Amber Checks are non-fatal. `pixel-mcp spec` needs FIGMA_TOKEN. "
+            "`pixel-mcp measure` needs Playwright + Chromium."
         )
-    return "All green — `pixel-mcp spec` is ready. Next slice: `measure` (issue #13)."
+    return "All green — `pixel-mcp spec` and `pixel-mcp measure` are ready."
 
 
 def build_envelope() -> Envelope:
@@ -196,6 +249,16 @@ def build_envelope() -> Envelope:
             {
                 "tool": "mcp__pixel_mcp__spec",
                 "when": "FIGMA_TOKEN configured — ready to extract a DesignSpec from a Figma Source",
+            }
+        )
+    if all(
+        any(c["name"] == n and c["status"] == "green" for c in checks)
+        for n in ("playwright", "chromium")
+    ):
+        affordances.append(
+            {
+                "tool": "mcp__pixel_mcp__measure",
+                "when": "Playwright + Chromium ready — capture a MeasuredDOM from a Render URL",
             }
         )
     return make_envelope(

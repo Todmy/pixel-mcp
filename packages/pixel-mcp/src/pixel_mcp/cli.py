@@ -1,7 +1,8 @@
 """Typer entry point — `pixel-mcp <verb>`.
 
-Slice 1 implements `doctor` and `mcp`; Slice 2 adds `spec`. Every other
-subcommand is a stub that points at the tracking issue and exits non-zero.
+Slice 1 implements `doctor` and `mcp`; Slice 2 adds `spec`; Slice 3 adds
+`measure`. Every other subcommand is a stub that points at the tracking
+issue and exits non-zero.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import typer
 from pixel_tools_shared import Envelope
 
 from pixel_mcp import doctor as doctor_mod
+from pixel_mcp import measure_cmd as measure_cmd_mod
 from pixel_mcp import spec_cmd as spec_cmd_mod
 from pixel_mcp.version import __version__
 
@@ -122,10 +124,65 @@ def spec(
     raise typer.Exit(code=exit_code)
 
 
+def _parse_viewport(raw: str) -> tuple[int, int]:
+    """Parse ``WxH`` strings (e.g. ``1280x720``) into a (w, h) tuple."""
+    try:
+        w_str, h_str = raw.lower().split("x", 1)
+        return (int(w_str), int(h_str))
+    except (ValueError, AttributeError) as exc:
+        raise typer.BadParameter(
+            f"Viewport must be of the form 'WIDTHxHEIGHT' (e.g. 1280x720); got {raw!r}."
+        ) from exc
+
+
+def _parse_selectors(raw: str | None) -> list[str] | None:
+    if raw is None:
+        return None
+    parts = [s.strip() for s in raw.split(",") if s.strip()]
+    return parts or None
+
+
 @app.command()
-def measure() -> None:
-    """Capture a MeasuredDOM from a Render. (stub)"""
-    _stub("measure", 13)
+def measure(
+    route: str = typer.Option(  # noqa: B008
+        ...,
+        "--route",
+        help="URL of the Render (e.g. http://localhost:3000/foo).",
+    ),
+    selectors: Optional[str] = typer.Option(  # noqa: B008, UP007
+        None,
+        "--selectors",
+        help="Comma-separated CSS selectors to measure. If omitted, auto-discover visible elements.",
+    ),
+    viewport: str = typer.Option(  # noqa: B008
+        "1280x720",
+        "--viewport",
+        help="Viewport size as WIDTHxHEIGHT (default 1280x720).",
+    ),
+    wait_for: Optional[str] = typer.Option(  # noqa: B008, UP007
+        None,
+        "--wait-for",
+        help="CSS selector that must appear before measurement begins.",
+    ),
+    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+        None,
+        "--out",
+        help="Write the AXI envelope JSON to this file. Defaults to stdout.",
+    ),
+) -> None:
+    """Capture a MeasuredDOM from a Render."""
+    envelope, exit_code = measure_cmd_mod.run(
+        route=route,
+        viewport=_parse_viewport(viewport),
+        selectors=_parse_selectors(selectors),
+        wait_for=wait_for,
+    )
+    payload = json.dumps(envelope, indent=2, default=str)
+    if out is not None:
+        out.write_text(payload)
+    else:
+        typer.echo(payload)
+    raise typer.Exit(code=exit_code)
 
 
 @app.command()
