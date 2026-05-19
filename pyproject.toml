@@ -1,0 +1,50 @@
+[project]
+name = "pixel-mcp-workspace"
+version = "0.0.0"
+description = "uv workspace root for pixel-mcp"
+requires-python = ">=3.11"
+# Workspace root is not published; real packages live under packages/.
+
+[tool.uv.workspace]
+members = [
+    "packages/shared",
+    "packages/pixel-mcp",
+    "packages/pixel-mcp-ml",
+]
+
+[tool.uv.sources]
+pixel-tools-shared = { workspace = true }
+pixel-mcp = { workspace = true }
+pixel-mcp-ml = { workspace = true }
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "pre-commit>=3.7",
+    "pixel-tools-shared",
+    "pixel-mcp",
+    "pixel-mcp-ml",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["packages/pixel-mcp/tests", "packages/shared/tests"]
+markers = [
+    "smoke: end-to-end smoke tests for slice acceptance",
+]
+addopts = "-ra"

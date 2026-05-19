@@ -1,0 +1,16 @@
+[project]
+name = "pixel-mcp-ml"
+version = "0.0.1"
+description = "ML extras for pixel-mcp (DINOv2, OmniParser, VLM bridges). Populated in Slices 6+."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Dmytro Tolok" }]
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pixel_mcp_ml"]
