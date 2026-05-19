@@ -79,10 +79,37 @@ def _dom(bg: str = "#ff0000") -> MeasuredDOM:
 
 @pytest.fixture
 def mocked_pipeline():
-    """Patch the heavy dependencies — Figma + Playwright — at module level."""
+    """Patch the heavy dependencies — Figma + Playwright — at module level.
+
+    Also isolates loop_state to a fresh in-memory IterationState so tests
+    don't carry highest_level_reached forward (which would otherwise
+    trigger regression detection on the next test).
+    """
+    from pixel_mcp.loop_state import IterationState
+
+    fresh_state = IterationState()
+
+    def _read(*args: object, **kwargs: object) -> IterationState:
+        return IterationState(
+            session_id=fresh_state.session_id,
+            iteration=fresh_state.iteration,
+            last_delta_hash=fresh_state.last_delta_hash,
+            highest_level_reached=fresh_state.highest_level_reached,
+            recent_hashes=list(fresh_state.recent_hashes),
+        )
+
+    def _write(state: IterationState, *args: object, **kwargs: object) -> None:
+        fresh_state.iteration = state.iteration
+        fresh_state.last_delta_hash = state.last_delta_hash
+        fresh_state.highest_level_reached = state.highest_level_reached
+        fresh_state.recent_hashes = list(state.recent_hashes)
+
     with (
         patch("pixel_mcp.check_cmd.extract_spec") as m_spec,
         patch("pixel_mcp.check_cmd.measure_render") as m_measure,
+        patch("pixel_mcp.check_cmd.read_state", side_effect=_read),
+        patch("pixel_mcp.check_cmd.write_state", side_effect=_write),
+        patch("pixel_mcp.check_cmd.append_history"),
     ):
         yield m_spec, m_measure
 

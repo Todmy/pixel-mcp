@@ -28,6 +28,18 @@ from pixel_mcp.delta import Delta, diff_design_vs_render
 from pixel_mcp.figma_client import FigmaApiError, FigmaAuthError, FigmaError, FigmaNotFoundError
 from pixel_mcp.figma_url import FigmaUrlError
 from pixel_mcp.judge import Tolerance, judge_deltas
+from pixel_mcp.loop_state import (
+    DEFAULT_MAX_ITERATIONS,
+    DEFAULT_STUCK_THRESHOLD,
+    HASH_TRAIL_MAX,
+    append_history,
+    detect_regression,
+    detect_stuck,
+    hash_deltas_bucketed,
+    now_utc,
+    read_state,
+    write_state,
+)
 from pixel_mcp.normalize import normalize_spec_for_viewport
 from pixel_mcp.render import (
     BoundingBox,
@@ -45,7 +57,9 @@ from pixel_mcp.spec import DesignSpec, UnsupportedNodeTypeError, extract_spec
 EXIT_CONVERGED = 0
 EXIT_DELTAS = 1
 EXIT_READY_FOR_LEVEL_3 = 2  # reserved
-EXIT_REGRESSION = 3  # reserved
+EXIT_REGRESSION = 3
+EXIT_MAX_ITERATIONS = 10
+EXIT_STUCK = 11
 EXIT_FATAL = 12
 
 
@@ -57,11 +71,29 @@ def run(
     wait_for: str | None = None,
     refresh_spec: bool = False,
     treat_minor_as_blocking: bool = False,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    stuck_threshold: int = DEFAULT_STUCK_THRESHOLD,
 ) -> tuple[Envelope, int]:
     """Run one Iteration of the Convergence Loop.
 
-    Never raises — all errors are folded into the AXI envelope.
+    Never raises — all errors are folded into the AXI envelope. Loop
+    economics (iteration counter, stuck detection, regression, max-iter)
+    are enforced via ``.pixel-mcp/state.json``.
     """
+    # --- 0) Iteration counter + max-iter pre-check ---
+    state = read_state()
+    state.iteration += 1
+    state.last_invocation_at = now_utc()
+    if state.iteration > max_iterations:
+        write_state(state)
+        return _fatal_envelope(
+            "max_iterations_exceeded",
+            f"Iteration {state.iteration} exceeded --max-iterations={max_iterations}.",
+            [
+                "Run `pixel-mcp reset` to start a fresh session.",
+                f"Or increase --max-iterations (current {max_iterations}).",
+            ],
+        ), EXIT_MAX_ITERATIONS
     # --- 1) Extract DesignSpec ---
     try:
         spec = extract_spec(figma_url, refresh=refresh_spec)
@@ -162,6 +194,31 @@ def run(
         visual_passes = ssim_ok and regions_ok
     overall_converged = judgment.converged and visual_passes
 
+    # --- 5) Loop economics: stuck detection + regression + state update ---
+    current_hash = hash_deltas_bucketed(deltas)
+    is_stuck = detect_stuck(state.recent_hashes, current_hash, threshold=stuck_threshold)
+    current_level_passed = 1 if overall_converged else 0
+    is_regression = detect_regression(state, current_level_passed)
+
+    state.last_delta_hash = current_hash
+    state.recent_hashes = (state.recent_hashes + [current_hash])[-HASH_TRAIL_MAX:]
+    if overall_converged and current_level_passed > state.highest_level_reached:
+        state.highest_level_reached = current_level_passed
+    write_state(state)
+
+    append_history(
+        {
+            "iteration": state.iteration,
+            "session_id": state.session_id,
+            "delta_count": len(deltas),
+            "delta_hash": current_hash,
+            "ssim_score": ssim_score,
+            "hot_region_count": len(hot_regions),
+            "converged": overall_converged,
+            "timestamp": now_utc().isoformat(),
+        }
+    )
+
     envelope = _success_envelope(
         spec=spec,
         dom=dom,
@@ -173,7 +230,17 @@ def run(
         regions=regions,
         visual_error=visual_error,
         overall_converged=overall_converged,
+        iteration=state.iteration,
+        session_id=state.session_id,
+        is_stuck=is_stuck,
+        is_regression=is_regression,
+        max_iterations=max_iterations,
     )
+
+    if is_regression:
+        return envelope, EXIT_REGRESSION
+    if is_stuck:
+        return envelope, EXIT_STUCK
     return envelope, (EXIT_CONVERGED if overall_converged else EXIT_DELTAS)
 
 
@@ -256,6 +323,11 @@ def _success_envelope(
     regions: list[Any] | None = None,
     visual_error: str | None = None,
     overall_converged: bool | None = None,
+    iteration: int | None = None,
+    session_id: str | None = None,
+    is_stuck: bool = False,
+    is_regression: bool = False,
+    max_iterations: int | None = None,
 ) -> Envelope:
     delta_dicts = [json.loads(d.model_dump_json()) for d in deltas]
     hot_regions = hot_regions or []
@@ -278,9 +350,27 @@ def _success_envelope(
         "spec_node_id": spec.figma_node_id,
         "dom_route": dom.route,
         "dom_element_count": len(dom.elements),
+        "iteration": iteration,
+        "session_id": session_id,
+        "max_iterations": max_iterations,
+        "is_stuck": is_stuck,
+        "is_regression": is_regression,
     }
 
     hints: list[str] = _build_hints(judgment_data, deltas, truncated)
+    if iteration is not None and max_iterations is not None:
+        hints.append(f"Iteration {iteration} of {max_iterations}.")
+    if is_stuck:
+        hints.append(
+            "STUCK: last 3 Iterations produced identical structured-delta hashes — "
+            "the Agent isn't making progress. Either fix the listed Deltas or run "
+            "`pixel-mcp reset` to clear state."
+        )
+    if is_regression:
+        hints.append(
+            "REGRESSION: a previously-passed Level is now failing. A recent edit "
+            "broke something that used to work."
+        )
     if ssim_score is not None and ssim_score < SSIM_THRESHOLD:
         hints.append(
             f"SSIM Score {ssim_score:.3f} below threshold {SSIM_THRESHOLD} — "
