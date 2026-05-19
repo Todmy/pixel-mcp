@@ -130,7 +130,15 @@ def bucket_for_magnitude(magnitude: float | None) -> str:
 
 
 def hash_deltas_bucketed(deltas: list[Delta]) -> str:
-    """Hash a Delta[] by (selector, property, magnitude_bucket, severity)."""
+    """Hash a Delta[] by (selector, property, magnitude_bucket, severity, viewport).
+
+    The ``viewport`` field (v2-1) is folded in so the same property mismatch
+    observed under different viewports hashes to distinct buckets — stuck
+    detection stays accurate when one viewport regresses while another
+    converges. Single-viewport callers have ``viewport=None`` (rendered as
+    the empty string) which keeps cross-version hash semantics stable for
+    the no-viewport case.
+    """
     rows = sorted(
         (
             (
@@ -138,10 +146,11 @@ def hash_deltas_bucketed(deltas: list[Delta]) -> str:
                 d.property,
                 bucket_for_magnitude(d.magnitude),
                 d.severity,
+                d.viewport or "",
             )
             for d in deltas
         ),
-        key=lambda t: (t[0], t[1], t[2], t[3]),
+        key=lambda t: (t[0], t[1], t[2], t[3], t[4]),
     )
     payload = json.dumps(rows, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

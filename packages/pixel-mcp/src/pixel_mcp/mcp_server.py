@@ -158,6 +158,7 @@ def check(
     enable_human_gate: bool = False,
     enable_omniparser: bool = False,
     omniparser_confidence_threshold: float = 0.3,
+    viewports: list[list[int]] | None = None,
 ) -> dict[str, Any]:
     """One Iteration of the Convergence Loop.
 
@@ -202,14 +203,24 @@ def check(
             ``pixel-mcp-ml --extra omniparser``.
         omniparser_confidence_threshold: Drop OmniParser detections below
             this confidence (default 0.3).
+        viewports: Optional list of ``[width, height]`` pairs. When set,
+            runs the full convergence pipeline at EACH viewport (v2-1
+            multi-viewport mode). Overall convergence is the AND-fold;
+            each Delta carries a ``viewport`` field locating the failing
+            breakpoint. JSON has no native tuple — pass as a list of
+            two-element lists, e.g. ``[[1280, 720], [375, 667]]``.
 
     Returns the AXI envelope wrapping ``{mode, converged, deltas, judgment, ...}``.
     """
+    parsed_viewports: list[tuple[int, int]] | None = None
+    if viewports is not None:
+        parsed_viewports = [(int(v[0]), int(v[1])) for v in viewports]
     envelope, _exit_code = check_cmd_mod.run(
         figma_url=figma_url,
         image_path=image_path,
         route=route,
         viewport=(viewport_width, viewport_height),
+        viewports=parsed_viewports,
         selectors=selectors,
         wait_for=wait_for,
         refresh_spec=refresh_spec,

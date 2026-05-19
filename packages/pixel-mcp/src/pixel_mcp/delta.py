@@ -56,6 +56,12 @@ class Delta(BaseModel):
     severity: Severity
     """Drives Gate Pass logic — critical and major block Final Convergence."""
 
+    viewport: str | None = None
+    """Viewport identifier (``"<W>x<H>"``) when the Delta was produced under a
+    multi-viewport check. ``None`` for single-viewport (v0/v1) callers — fully
+    backward compatible. Different viewports produce different hash buckets so
+    stuck/regression detection stays accurate across the responsive matrix."""
+
 
 class _FlatSpecNode(BaseModel):
     """Flattened view of a node in the DesignSpec tree — used internally for pairing."""

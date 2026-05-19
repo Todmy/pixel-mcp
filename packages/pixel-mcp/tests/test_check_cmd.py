@@ -1253,6 +1253,171 @@ def test_match_detected_to_region_picks_highest_iou_inside_centre() -> None:
     assert _match_detected_to_region(region, [far]) is None
 
 
+# ---------------------------------------------------------------------------
+# v2-1 — Multi-viewport check
+# ---------------------------------------------------------------------------
+
+
+def test_single_viewport_backward_compat(mocked_pipeline: Any) -> None:
+    """Default (``viewports=None``) preserves single-viewport pipeline output."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    envelope, exit_code = check_run(
+        figma_url="https://figma.com/design/abc?node-id=1-1",
+        route="http://localhost:3000/",
+    )
+    # Identical contract to the v0/v1 happy-path test: exit 0, no
+    # per-viewport aggregation surfaced.
+    assert exit_code == EXIT_CONVERGED
+    assert envelope["data"]["converged"] is True
+    assert envelope["data"]["deltas"] == []
+    assert "viewport_results" not in envelope["data"]
+    assert "viewports" not in envelope["data"]
+
+
+def test_multi_viewport_all_pass_converges(mocked_pipeline: Any) -> None:
+    """All 3 viewports matching → exit 0, viewport_results has 3 entries."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    envelope, exit_code = check_run(
+        figma_url="https://figma.com/design/abc?node-id=1-1",
+        route="http://localhost:3000/",
+        viewports=[(1280, 720), (768, 1024), (375, 667)],
+    )
+
+    assert exit_code == EXIT_CONVERGED
+    assert envelope["data"]["converged"] is True
+    assert envelope["data"]["viewports"] == ["1280x720", "768x1024", "375x667"]
+    vr = envelope["data"]["viewport_results"]
+    assert isinstance(vr, list) and len(vr) == 3
+    assert all(entry["converged"] is True for entry in vr)
+    assert envelope["data"]["deltas"] == []
+
+
+def test_multi_viewport_one_fails_blocks_overall(mocked_pipeline: Any) -> None:
+    """Inject a delta only at the middle viewport — overall converged=False."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+
+    call_counter = {"i": 0}
+
+    def _measure_side_effect(*_args: Any, **_kwargs: Any) -> tuple[MeasuredDOM, bool]:
+        # First call → 1280x720, second → 768x1024 (bad), third → 375x667.
+        i = call_counter["i"]
+        call_counter["i"] += 1
+        bg = "#00ff00" if i == 1 else "#ff0000"
+        return _dom(bg=bg), False
+
+    m_measure.side_effect = _measure_side_effect
+
+    envelope, exit_code = check_run(
+        figma_url="https://figma.com/design/abc?node-id=1-1",
+        route="http://localhost:3000/",
+        viewports=[(1280, 720), (768, 1024), (375, 667)],
+    )
+
+    assert exit_code == EXIT_DELTAS
+    assert envelope["data"]["converged"] is False
+    vr = envelope["data"]["viewport_results"]
+    assert len(vr) == 3
+    failing = [entry for entry in vr if entry["converged"] is False]
+    assert len(failing) == 1
+    assert failing[0]["viewport"] == "768x1024"
+    # Other two viewports stay green.
+    passing = [entry for entry in vr if entry["converged"]]
+    assert {entry["viewport"] for entry in passing} == {"1280x720", "375x667"}
+
+
+def test_deltas_carry_viewport_field(mocked_pipeline: Any) -> None:
+    """Every Delta produced under multi-viewport carries the viewport string."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    # Inject a colour delta into EVERY viewport so each contributes Deltas.
+    m_measure.return_value = (_dom(bg="#00ff00"), False)
+
+    envelope, exit_code = check_run(
+        figma_url="https://figma.com/design/abc?node-id=1-1",
+        route="http://localhost:3000/",
+        viewports=[(1280, 720), (375, 667)],
+    )
+
+    assert exit_code == EXIT_DELTAS
+    deltas = envelope["data"]["deltas"]
+    assert deltas, "expected aggregated Deltas across viewports"
+    viewport_values = {d["viewport"] for d in deltas}
+    assert viewport_values == {"1280x720", "375x667"}
+    # And every delta is tagged — no None leaking through.
+    assert all(d["viewport"] in {"1280x720", "375x667"} for d in deltas)
+
+
+def test_crops_persisted_per_viewport_namespace(
+    mocked_pipeline: Any,
+    real_visual_signals_with_tmp_crops: Path,
+) -> None:
+    """Crops land under ``.pixel-mcp/crops/iter-N/viewport-WxH/`` per viewport."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    tmp_root = real_visual_signals_with_tmp_crops
+
+    check_run(
+        figma_url="https://figma.com/design/abc?node-id=1-1",
+        route="http://localhost:3000/",
+        viewports=[(1280, 720), (375, 667)],
+    )
+
+    iter_root = tmp_root / ".pixel-mcp" / "crops" / "iter-1"
+    desktop_dir = iter_root / "viewport-1280x720"
+    mobile_dir = iter_root / "viewport-375x667"
+    assert desktop_dir.is_dir(), f"expected {desktop_dir} to exist"
+    assert mobile_dir.is_dir(), f"expected {mobile_dir} to exist"
+    # Each viewport got its own exp/act crop pair AND actual.png.
+    assert (desktop_dir / "exp-r1.png").exists()
+    assert (desktop_dir / "act-r1.png").exists()
+    assert (desktop_dir / "actual.png").exists()
+    assert (mobile_dir / "exp-r1.png").exists()
+    assert (mobile_dir / "act-r1.png").exists()
+
+
+def test_viewports_preset_responsive_expands_to_three(tmp_path: Path, mocked_pipeline: Any) -> None:
+    """`--viewports-preset responsive` expands to the three default breakpoints."""
+    from pixel_mcp.cli import app
+    from typer.testing import CliRunner
+
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    runner = CliRunner()
+    out = tmp_path / "envelope.json"
+    result = runner.invoke(
+        app,
+        [
+            "check",
+            "--figma",
+            "https://figma.com/design/abc?node-id=1-1",
+            "--route",
+            "http://localhost:3000/",
+            "--viewports-preset",
+            "responsive",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    envelope = json.loads(out.read_text())
+    assert envelope["data"]["viewports"] == ["1280x720", "768x1024", "375x667"]
+    assert len(envelope["data"]["viewport_results"]) == 3
+    assert envelope["data"]["converged"] is True
+    # measure_render must have been called once per viewport.
+    assert m_measure.call_count == 3
+
+
 def test_vlm_prompt_unchanged_when_semantic_label_absent(
     mocked_pipeline: Any, tmp_path: Path
 ) -> None:

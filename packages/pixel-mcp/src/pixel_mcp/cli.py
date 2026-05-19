@@ -143,6 +143,43 @@ def _parse_viewport(raw: str) -> tuple[int, int]:
         ) from exc
 
 
+_VIEWPORT_PRESETS: dict[str, str] = {
+    "responsive": "1280x720,768x1024,375x667",
+}
+
+
+def _parse_viewports(raw: str | None, preset: str | None) -> list[tuple[int, int]] | None:
+    """Resolve the multi-viewport list from ``--viewports`` / ``--viewports-preset``.
+
+    Returns ``None`` when neither flag is set (single-viewport behaviour
+    preserved). When both are set, the explicit ``--viewports`` value wins
+    and a Typer warning surfaces. Each entry is parsed via ``_parse_viewport``
+    so mistyped values fail loud at the CLI boundary instead of producing a
+    broken multi-viewport check.
+    """
+    chosen: str | None = None
+    if raw is not None:
+        chosen = raw
+        if preset is not None:
+            typer.echo(
+                f"--viewports overrides --viewports-preset={preset!r}.",
+                err=True,
+            )
+    elif preset is not None:
+        if preset not in _VIEWPORT_PRESETS:
+            raise typer.BadParameter(
+                f"Unknown viewport preset {preset!r}. "
+                f"Known: {', '.join(sorted(_VIEWPORT_PRESETS))}."
+            )
+        chosen = _VIEWPORT_PRESETS[preset]
+    if chosen is None:
+        return None
+    parts = [p.strip() for p in chosen.split(",") if p.strip()]
+    if not parts:
+        return None
+    return [_parse_viewport(p) for p in parts]
+
+
 def _parse_selectors(raw: str | None) -> list[str] | None:
     if raw is None:
         return None
@@ -268,7 +305,20 @@ def check(
     viewport: str = typer.Option(  # noqa: B008
         "1280x720",
         "--viewport",
-        help="Viewport size as WIDTHxHEIGHT (default 1280x720).",
+        help="Viewport size as WIDTHxHEIGHT (default 1280x720). Ignored when --viewports is set.",
+    ),
+    viewports: Optional[str] = typer.Option(  # noqa: B008, UP007
+        None,
+        "--viewports",
+        help="Comma-separated viewport list (e.g. '1280x720,375x667,768x1024'). "
+        "Runs the full convergence pipeline at each viewport (v2-1). "
+        "Mutually compatible with --viewport — when both are set, --viewports wins.",
+    ),
+    viewports_preset: Optional[str] = typer.Option(  # noqa: B008, UP007
+        None,
+        "--viewports-preset",
+        help="Convenience: expand a named preset to --viewports. "
+        "'responsive' = 1280x720,768x1024,375x667.",
     ),
     wait_for: Optional[str] = typer.Option(  # noqa: B008, UP007
         None,
@@ -341,11 +391,13 @@ def check(
     Image-only mode (``--image``): measure + visual signals (SSIM + Hot Regions).
     Exactly one of ``--figma`` or ``--image`` must be provided.
     """
+    parsed_viewports = _parse_viewports(viewports, viewports_preset)
     envelope, exit_code = check_cmd_mod.run(
         figma_url=figma,
         image_path=image,
         route=route,
         viewport=_parse_viewport(viewport),
+        viewports=parsed_viewports,
         selectors=_parse_selectors(selectors),
         wait_for=wait_for,
         refresh_spec=refresh_spec,

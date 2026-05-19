@@ -51,6 +51,9 @@ class Region(BaseModel):
     diff_crop_path: str | None = None
     semantic_label: str | None = None
     semantic_confidence: float | None = None
+    viewport: str | None = None
+    """Viewport identifier (``"<W>x<H>"``) when the Region was produced under
+    a multi-viewport check. ``None`` for single-viewport callers."""
 
 
 def decompose_hot_regions(
@@ -62,6 +65,7 @@ def decompose_hot_regions(
     crops_dir: Path | None = None,
     iteration: int = 0,
     mappings: dict[str, str] | None = None,
+    viewport_subfolder: str | None = None,
 ) -> list[Region]:
     """Attribute each Hot Region to a DOM element and emit a Region list.
 
@@ -78,6 +82,11 @@ def decompose_hot_regions(
         mappings: Optional ``figma_node_id → css_selector`` map (Slice #18).
             When present, regions whose leaf_selector matches get a
             figma_node_id assigned.
+        viewport_subfolder: Optional sub-path (e.g. ``"viewport-1280x720"``)
+            inserted under ``iter-N`` to namespace crops per viewport when the
+            v2-1 multi-viewport check is in effect. The string is also written
+            onto each emitted Region's ``viewport`` field (stripped of the
+            ``viewport-`` prefix).
 
     Returns:
         List of :class:`Region` — one per attributed Hot Region. Empty when
@@ -95,7 +104,17 @@ def decompose_hot_regions(
     iter_dir: Path | None = None
     if crops_dir is not None and expected_image is not None and actual_image is not None:
         iter_dir = crops_dir / f"iter-{iteration}"
+        if viewport_subfolder:
+            iter_dir = iter_dir / viewport_subfolder
         iter_dir.mkdir(parents=True, exist_ok=True)
+
+    # Derive the public ``Region.viewport`` value (e.g. ``"1280x720"``) from
+    # the ``"viewport-..."`` sub-folder name. ``None`` for single-viewport.
+    region_viewport: str | None = None
+    if viewport_subfolder and viewport_subfolder.startswith("viewport-"):
+        region_viewport = viewport_subfolder[len("viewport-") :]
+    elif viewport_subfolder:
+        region_viewport = viewport_subfolder
 
     out: list[Region] = []
     for i, region in enumerate(hot_regions):
@@ -120,6 +139,7 @@ def decompose_hot_regions(
                 figma_node_id=figma_node,
                 expected_crop_path=exp_path,
                 actual_crop_path=act_path,
+                viewport=region_viewport,
             )
         )
     return out
