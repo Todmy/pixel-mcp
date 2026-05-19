@@ -415,3 +415,171 @@ def test_check_writes_envelope_via_cli(tmp_path: Path, mocked_pipeline: Any) -> 
     assert result.exit_code == 0, result.output
     envelope = json.loads(out.read_text())
     assert envelope["data"]["converged"] is True
+
+
+# ---------------------------------------------------------------------------
+# v0.5-4 — Crop persistence wiring through `_compute_visual_signals`
+# ---------------------------------------------------------------------------
+
+
+def _png_bytes(
+    color: tuple[int, int, int] = (255, 0, 0), size: tuple[int, int] = (200, 200)
+) -> bytes:
+    """Build a small in-memory PNG so tests don't depend on disk fixtures."""
+    import io
+
+    from PIL import Image
+
+    img = Image.new("RGB", size, color=color)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@pytest.fixture
+def real_visual_signals_with_tmp_crops(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Wire `_compute_visual_signals` to run for real but with safe upstream stubs.
+
+    Patches the heavy edges — Figma fetch, Playwright capture, and the
+    compute_hot_regions/compute_ssim numerics — so the real
+    `decompose_hot_regions` (and its disk persistence) executes end-to-end
+    inside ``tmp_path``. The whole point of this fixture is to verify the
+    ``crops_dir`` + ``iteration`` plumbing actually lands files on disk.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    expected_png = _png_bytes(color=(255, 0, 0))
+    actual_png = _png_bytes(color=(0, 0, 255))
+
+    # Stub Figma fetch — used only when figma_url is set.
+    fake_client = MagicMock()
+    fake_client.__enter__ = lambda self: fake_client
+    fake_client.__exit__ = lambda self, *a: None
+    fake_client.fetch_node_png_bytes = MagicMock(return_value=expected_png)
+
+    # Stub Playwright screenshot — used in both modes.
+    monkeypatch.setattr(
+        "pixel_mcp.check_cmd.capture_screenshot",
+        lambda **_: actual_png,
+    )
+
+    # Stub the numerics. compute_hot_regions returns one synthetic BoundingBox
+    # large enough to clear MIN_BBOX_AREA. compute_ssim returns a passing score.
+    fake_bbox = BoundingBox(x=10.0, y=10.0, w=50.0, h=50.0)
+    monkeypatch.setattr(
+        "pixel_mcp.hot_regions.compute_hot_regions",
+        lambda *_a, **_kw: [fake_bbox],
+    )
+    monkeypatch.setattr(
+        "pixel_mcp.hot_regions.compute_ssim",
+        lambda *_a, **_kw: 0.99,
+    )
+    # Stub FigmaClient at its source module so the lazy import inside
+    # _compute_visual_signals picks up the stub.
+    monkeypatch.setattr(
+        "pixel_mcp.figma_client.FigmaClient",
+        lambda *a, **kw: fake_client,
+    )
+
+    return tmp_path
+
+
+def test_check_persists_crops_to_state_dir(
+    mocked_pipeline: Any,
+    real_visual_signals_with_tmp_crops: Path,
+) -> None:
+    """Figma-mode check writes exp-r*.png + act-r*.png under .pixel-mcp/crops/iter-1/."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    tmp_root = real_visual_signals_with_tmp_crops
+
+    envelope, _exit = check_run(
+        figma_url="https://figma.com/design/abc?node-id=1-1",
+        route="http://localhost:3000/",
+    )
+
+    iter_dir = tmp_root / ".pixel-mcp" / "crops" / "iter-1"
+    assert iter_dir.is_dir(), f"expected {iter_dir} to exist"
+    assert (iter_dir / "exp-r1.png").exists(), "expected expected-crop on disk"
+    assert (iter_dir / "act-r1.png").exists(), "expected actual-crop on disk"
+
+    # Envelope must reflect the Region with non-None crop paths.
+    regions_payload = envelope["data"].get("regions") or []
+    assert any(
+        r.get("expected_crop_path") and r.get("actual_crop_path") for r in regions_payload
+    ), "Region payload should carry crop paths once persistence is wired"
+
+
+def test_check_image_only_persists_crops_to_state_dir(
+    mocked_pipeline: Any,
+    real_visual_signals_with_tmp_crops: Path,
+    tmp_path: Path,
+) -> None:
+    """Image-only mode writes the same .pixel-mcp/crops/iter-1/ pair."""
+    _m_spec, m_measure = mocked_pipeline
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    # An --image path on disk so the pre-validation passes.
+    img_path = tmp_path / "design.png"
+    img_path.write_bytes(_png_bytes())
+
+    tmp_root = real_visual_signals_with_tmp_crops
+
+    check_run(
+        image_path=str(img_path),
+        route="http://localhost:3000/",
+    )
+
+    iter_dir = tmp_root / ".pixel-mcp" / "crops" / "iter-1"
+    assert iter_dir.is_dir()
+    assert (iter_dir / "exp-r1.png").exists()
+    assert (iter_dir / "act-r1.png").exists()
+
+
+def test_dinov2_gate_scores_persisted_crops(
+    mocked_pipeline: Any,
+    real_visual_signals_with_tmp_crops: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: persisted crops feed real Region objects with non-None paths into the gate."""
+    m_spec, m_measure = mocked_pipeline
+    m_spec.return_value = _spec()
+    m_measure.return_value = (_dom(bg="#ff0000"), False)
+
+    # Override the bbox to be just below MIN_BBOX_AREA so Level 0 visual gate
+    # passes (no significant hot region) while decompose still emits a Region
+    # with crop paths for the DINOv2 gate to score.
+    small_bbox = BoundingBox(x=10.0, y=10.0, w=9.0, h=10.0)  # area = 90 < 100
+    monkeypatch.setattr(
+        "pixel_mcp.hot_regions.compute_hot_regions",
+        lambda *_a, **_kw: [small_bbox],
+    )
+
+    # The DINOv2 batch fn captures whatever crop paths the gate hands it.
+    captured_pairs: list[tuple[str, str]] = []
+
+    def _fake_batch(pairs):
+        captured_pairs.extend(pairs)
+        return [0.99] * len(pairs)
+
+    fake_pkg = types.ModuleType("pixel_mcp_ml")
+    fake_pkg.compute_dinov2_similarity_batch = _fake_batch  # type: ignore[attr-defined]
+
+    with patch.dict(sys.modules, {"pixel_mcp_ml": fake_pkg}):
+        envelope, exit_code = check_run(
+            figma_url="https://figma.com/design/abc?node-id=1-1",
+            route="http://localhost:3000/",
+            enable_dinov2=True,
+        )
+
+    # Crops were on disk AND fed into the gate with real, non-None paths.
+    assert captured_pairs, "DINOv2 gate should have received at least one crop pair"
+    for exp_path, act_path in captured_pairs:
+        assert exp_path is not None and act_path is not None
+        assert Path(exp_path).exists(), f"exp crop missing on disk: {exp_path}"
+        assert Path(act_path).exists(), f"act crop missing on disk: {act_path}"
+
+    assert exit_code == EXIT_CONVERGED
+    assert envelope["data"]["level_reached"] == 1

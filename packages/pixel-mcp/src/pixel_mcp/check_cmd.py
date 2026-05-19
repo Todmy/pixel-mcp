@@ -68,6 +68,7 @@ from pixel_mcp.render import (
     measure_render,
 )
 from pixel_mcp.spec import DesignSpec, UnsupportedNodeTypeError, extract_spec
+from pixel_mcp.state import state_dir
 
 EXIT_CONVERGED = 0
 EXIT_DELTAS = 1
@@ -254,6 +255,7 @@ def run(
         viewport=viewport,
         wait_for=wait_for,
         dom=dom,
+        iteration=state.iteration,
     )
 
     # --- 4b) Image-only mode: synthesize pseudo-Deltas from Hot Regions ---
@@ -437,6 +439,8 @@ def _compute_visual_signals(
     viewport: tuple[int, int],
     wait_for: str | None,
     dom: MeasuredDOM,
+    project_root: Path | None = None,
+    iteration: int = 0,
 ) -> tuple[float | None, list[BoundingBox], list[Any], str | None]:
     """Best-effort visual diff + decomposition.
 
@@ -449,6 +453,14 @@ def _compute_visual_signals(
     Figma mode the caller treats this as best-effort and falls back to the
     structured-Delta verdict; in image-only mode the caller treats it as a
     hard fail (no other signal exists).
+
+    When ``iteration`` is set (and a usable ``project_root`` is resolved),
+    expected/actual Crops for each decomposed Region are persisted to
+    ``<project_root>/.pixel-mcp/crops/iter-<iteration>/`` so the Level 1
+    DINOv2 gate can score them. Without this wiring the gate sees Regions
+    with ``expected_crop_path=None`` and silently auto-passes — a known
+    foot-gun documented in the Valis lesson
+    ``lesson-dinov2-gate-noop-without-crop-persistence``.
     """
     try:
         # Lazy imports — keep cv2/skimage out of the critical path when
@@ -486,11 +498,14 @@ def _compute_visual_signals(
             actual_img,
             min_bbox_area=MIN_BBOX_AREA,
         )
+        crops_root = state_dir(project_root) / "crops"
         regions = decompose_hot_regions(
             bboxes,
             dom,
             expected_image=expected_img,
             actual_image=actual_img,
+            crops_dir=crops_root,
+            iteration=iteration,
         )
         return ssim, bboxes, regions, None
     except Exception as exc:  # noqa: BLE001
