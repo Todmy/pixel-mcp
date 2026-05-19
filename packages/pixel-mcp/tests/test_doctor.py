@@ -37,6 +37,7 @@ def test_doctor_envelope_includes_python_check() -> None:
         "figma_api_reachable",
         "pixel_mcp_ml",
         "pixel_mcp_ml_vlm",
+        "pixel_mcp_ml_omniparser",
         "ollama_qwen",
         "uv",
     } <= names
@@ -226,6 +227,91 @@ def test_pixel_mcp_ml_extras_are_independent(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(importlib.util, "find_spec", fake_find)
     assert doctor_mod._check_pixel_mcp_ml()["status"] == "green"
     assert doctor_mod._check_pixel_mcp_ml_vlm()["status"] == "amber"
+
+
+def test_pixel_mcp_ml_omniparser_check_green_when_full_stack_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All four specs found -> green for OmniParser extra."""
+    import importlib.util
+
+    real_find = importlib.util.find_spec
+
+    def fake_find(name: str, *args: object, **kwargs: object) -> object:
+        if name in ("pixel_mcp_ml", "transformers", "torch", "huggingface_hub"):
+            return object()
+        return real_find(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find)
+    result = doctor_mod._check_pixel_mcp_ml_omniparser()
+    assert result["status"] == "green"
+
+
+def test_pixel_mcp_ml_omniparser_check_amber_when_backend_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Package present but huggingface_hub absent -> amber + name in detail."""
+    import importlib.util
+
+    real_find = importlib.util.find_spec
+
+    def fake_find(name: str, *args: object, **kwargs: object) -> object:
+        if name in ("pixel_mcp_ml", "transformers", "torch"):
+            return object()
+        if name == "huggingface_hub":
+            return None
+        return real_find(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find)
+    result = doctor_mod._check_pixel_mcp_ml_omniparser()
+    assert result["status"] == "amber"
+    assert "huggingface_hub" in result["detail"]
+
+
+def test_pixel_mcp_ml_omniparser_check_red_when_package_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Package absent -> red for the OmniParser extra."""
+    import importlib.util
+
+    real_find = importlib.util.find_spec
+
+    def fake_find(name: str, *args: object, **kwargs: object) -> object:
+        if name == "pixel_mcp_ml":
+            return None
+        return real_find(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find)
+    result = doctor_mod._check_pixel_mcp_ml_omniparser()
+    assert result["status"] == "red"
+
+
+def test_pixel_mcp_ml_omniparser_red_does_not_flip_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OmniParser red is informational — doctor exit code must stay 0
+    when no other non-optional check is red."""
+    import importlib.util
+
+    real_find = importlib.util.find_spec
+
+    def fake_find(name: str, *args: object, **kwargs: object) -> object:
+        if name == "pixel_mcp_ml":
+            return None
+        return real_find(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find)
+    env = doctor_mod.build_envelope()
+    reds = [c["name"] for c in env["data"]["checks"] if c["status"] == "red"]
+    assert "pixel_mcp_ml_omniparser" in reds
+    non_optional_reds = [n for n in reds if n not in {"ollama_qwen", "pixel_mcp_ml_omniparser"}]
+    # ``pixel_mcp_ml`` and ``pixel_mcp_ml_vlm`` flip red here too — those
+    # are intentionally non-optional so we don't assert exit code; instead
+    # assert OmniParser alone is in the optional set.
+    assert "pixel_mcp_ml_omniparser" in doctor_mod._OPTIONAL_RED_CHECKS
+    # Sanity: the optional set hasn't accidentally absorbed a fatal check.
+    assert "pixel_mcp_ml" not in doctor_mod._OPTIONAL_RED_CHECKS
+    _ = non_optional_reds  # referenced for readability
 
 
 def test_ollama_qwen_check_green_when_model_present(

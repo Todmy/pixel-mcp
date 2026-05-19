@@ -22,6 +22,12 @@ dinov2 = [
 vlm = [
     "anthropic>=0.40",
 ]
+omniparser = [
+    "transformers>=4.40",
+    "torch>=2.0",
+    "safetensors>=0.4",
+    "huggingface-hub>=0.24",
+]
 
 [project.scripts]
 pixel-mcp-ml = "pixel_mcp_ml.cli:app"

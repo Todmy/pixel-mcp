@@ -1,11 +1,11 @@
 """Typer entry point — `pixel-mcp-ml <verb>`.
 
-Currently exposes two verbs:
+Currently exposes three verbs:
 
 - ``dinov2-compare`` — Level 1 perceptual similarity.
 - ``vlm-verify`` — Level 2 vision-language model verdict.
-
-Future slices add ``omniparser-detect`` and a local Qwen backend.
+- ``omniparser-detect`` — UI-element detection (region-attribution
+  infrastructure; wired into ``pixel-mcp check`` in v1.5-2).
 
 Exit codes:
 
@@ -27,6 +27,10 @@ from pixel_mcp_ml.dinov2_compare import (
     ModelSize,
     compute_dinov2_similarity,
 )
+from pixel_mcp_ml.omniparser_detect import (
+    OmniParserNotInstalledError,
+    detect_ui_elements,
+)
 from pixel_mcp_ml.version import __version__
 from pixel_mcp_ml.vlm_verify import (
     VLMNotInstalledError,
@@ -36,7 +40,7 @@ from pixel_mcp_ml.vlm_verify import (
 
 app = typer.Typer(
     name="pixel-mcp-ml",
-    help="ML extras for pixel-mcp (DINOv2 similarity, VLM verification).",
+    help="ML extras for pixel-mcp (DINOv2 similarity, VLM verification, OmniParser detection).",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -180,6 +184,48 @@ def vlm_verify(
             f"Verdict: {judgment.verdict} (confidence: {judgment.confidence:.2f}) "
             f'— "{judgment.reasoning}"'
         )
+
+
+@app.command("omniparser-detect")
+def omniparser_detect(
+    image: Path = typer.Argument(..., help="Path to the screenshot."),  # noqa: B008
+    confidence_threshold: float = typer.Option(  # noqa: B008
+        0.3,
+        "--confidence-threshold",
+        help="Drop detections below this score (default 0.3).",
+    ),
+    json: bool = typer.Option(  # noqa: B008
+        False,
+        "--json",
+        help="Emit JSON instead of the human-readable table.",
+    ),
+) -> None:
+    """Detect UI elements (button/input/icon/text/...) in a screenshot."""
+    if not image.exists():
+        typer.echo(f"image not found: {image}", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        detections = detect_ui_elements(
+            image,
+            confidence_threshold=confidence_threshold,
+        )
+    except OmniParserNotInstalledError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=12) from exc
+
+    if json:
+        payload = [d.model_dump() for d in detections]
+        typer.echo(json_mod.dumps(payload))
+        return
+
+    if not detections:
+        typer.echo("No UI elements detected above the confidence threshold.")
+        return
+
+    for det in detections:
+        x, y, w, h = det.bbox
+        typer.echo(f"[{x:.0f},{y:.0f},{w:.0f},{h:.0f}] {det.label} ({det.confidence:.2f})")
 
 
 if __name__ == "__main__":

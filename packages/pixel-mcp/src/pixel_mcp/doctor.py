@@ -241,6 +241,53 @@ def _check_pixel_mcp_ml_vlm() -> CheckResult:
     }
 
 
+def _check_pixel_mcp_ml_omniparser() -> CheckResult:
+    """Plugin check — is the ``omniparser`` extra installed?
+
+    Tri-state, evaluated independently of the ``dinov2`` and ``vlm``
+    extras:
+
+    - green: package found AND ``transformers`` + ``torch`` +
+      ``huggingface_hub`` all importable.
+    - amber: package found but at least one OmniParser backend missing.
+    - red:   package not found at all.
+
+    Mirrors the lazy-probe discipline of the other ML checks — never
+    imports the heavyweight modules, only ``find_spec``s them.
+    """
+    if importlib.util.find_spec("pixel_mcp_ml") is None:
+        return {
+            "name": "pixel_mcp_ml_omniparser",
+            "status": "red",
+            "detail": "pixel-mcp-ml not installed (OmniParser detection unavailable)",
+        }
+    have_transformers = importlib.util.find_spec("transformers") is not None
+    have_torch = importlib.util.find_spec("torch") is not None
+    have_hf_hub = importlib.util.find_spec("huggingface_hub") is not None
+    if have_transformers and have_torch and have_hf_hub:
+        return {
+            "name": "pixel_mcp_ml_omniparser",
+            "status": "green",
+            "detail": "pixel-mcp-ml installed with transformers + torch + huggingface_hub",
+        }
+    missing = [
+        name
+        for name, present in (
+            ("transformers", have_transformers),
+            ("torch", have_torch),
+            ("huggingface_hub", have_hf_hub),
+        )
+        if not present
+    ]
+    return {
+        "name": "pixel_mcp_ml_omniparser",
+        "status": "amber",
+        "detail": (
+            "pixel-mcp-ml installed but OmniParser backend missing: " f"{', '.join(missing)}"
+        ),
+    }
+
+
 def _check_ollama_qwen() -> CheckResult:
     """Probe a local Ollama daemon + the ``qwen2.5vl`` model presence.
 
@@ -326,6 +373,7 @@ def run_checks() -> list[CheckResult]:
         _check_figma_api_reachable(),
         _check_pixel_mcp_ml(),
         _check_pixel_mcp_ml_vlm(),
+        _check_pixel_mcp_ml_omniparser(),
         _check_ollama_qwen(),
         _check_uv(),
     ]
@@ -351,6 +399,11 @@ def _hints_for(checks: list[CheckResult]) -> list[str]:
             hints.append(
                 "Install pixel-mcp-ml: `uv tool install pixel-mcp-ml` "
                 "(Level 2 VLM verification gate)."
+            )
+        elif c["name"] == "pixel_mcp_ml_omniparser":
+            hints.append(
+                "Install pixel-mcp-ml: `uv tool install pixel-mcp-ml` "
+                "(OmniParser UI-element detection)."
             )
         elif c["name"] == "ollama_qwen":
             hints.append(
@@ -388,6 +441,10 @@ def _hints_for(checks: list[CheckResult]) -> list[str]:
             hints.append(
                 "Install VLM extras: `uv tool install pixel-mcp-ml --extra vlm` "
                 "(adds anthropic SDK for the Claude backend)."
+            )
+        elif c["name"] == "pixel_mcp_ml_omniparser":
+            hints.append(
+                "Install OmniParser extras: `uv tool install pixel-mcp-ml --extra omniparser`"
             )
         elif c["name"] == "ollama_qwen":
             hints.append(
@@ -445,12 +502,15 @@ def build_envelope() -> Envelope:
     )
 
 
-_OPTIONAL_RED_CHECKS = frozenset({"ollama_qwen"})
+_OPTIONAL_RED_CHECKS = frozenset({"ollama_qwen", "pixel_mcp_ml_omniparser"})
 """Checks whose red status is informational, not fatal.
 
 The ``qwen-local`` backend is an opt-in alternative to the default
 Claude path — most operators never need it, so an unreachable Ollama
-daemon should not flip the doctor exit code."""
+daemon should not flip the doctor exit code.
+
+OmniParser is opt-in detection infrastructure (v1.5 PRD) — until v1.5-2
+wires it into ``check``, missing the extra is informational only."""
 
 
 def exit_code_for(envelope: Envelope) -> int:

@@ -1415,6 +1415,12 @@ dinov2 = [
     { name = "torch" },
     { name = "transformers" },
 ]
+omniparser = [
+    { name = "huggingface-hub" },
+    { name = "safetensors" },
+    { name = "torch" },
+    { name = "transformers" },
+]
 vlm = [
     { name = "anthropic" },
 ]
@@ -1423,11 +1429,15 @@ vlm = [
 requires-dist = [
     { name = "anthropic", marker = "extra == 'vlm'", specifier = ">=0.40" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "huggingface-hub", marker = "extra == 'omniparser'", specifier = ">=0.24" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "safetensors", marker = "extra == 'dinov2'", specifier = ">=0.4" },
+    { name = "safetensors", marker = "extra == 'omniparser'", specifier = ">=0.4" },
     { name = "torch", marker = "extra == 'dinov2'", specifier = ">=2.0" },
+    { name = "torch", marker = "extra == 'omniparser'", specifier = ">=2.0" },
     { name = "transformers", marker = "extra == 'dinov2'", specifier = ">=4.40" },
+    { name = "transformers", marker = "extra == 'omniparser'", specifier = ">=4.40" },
     { name = "typer", specifier = ">=0.12" },
 ]
 
