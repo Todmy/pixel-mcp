@@ -90,8 +90,8 @@ def test_help_lists_subcommands(runner: CliRunner) -> None:
 
 
 def test_stub_subcommand_exits_nonzero(runner: CliRunner) -> None:
-    # `spec` (Slice 2), `measure` (Slice 3), `diff`/`judge`/`check` (Slice 4)
-    # are no longer stubs. `mapping` is the next stub (Slice 8).
-    result = runner.invoke(app, ["mapping"])
+    # spec/measure/diff/judge/check (Slices 2-4) and mapping (Slice 8) are now
+    # real. `snapshot` is the next stub (Slice 10).
+    result = runner.invoke(app, ["snapshot"])
     assert result.exit_code != 0
-    assert "Todmy/PBaaS#18" in (result.stderr or result.output)
+    assert "Todmy/PBaaS#20" in (result.stderr or result.output)

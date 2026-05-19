@@ -19,6 +19,7 @@ from pixel_mcp import check_cmd as check_cmd_mod
 from pixel_mcp import diff_cmd as diff_cmd_mod
 from pixel_mcp import doctor as doctor_mod
 from pixel_mcp import judge_cmd as judge_cmd_mod
+from pixel_mcp import mapping_cmd as mapping_cmd_mod
 from pixel_mcp import measure_cmd as measure_cmd_mod
 from pixel_mcp import spec_cmd as spec_cmd_mod
 from pixel_mcp.version import __version__
@@ -308,9 +309,36 @@ def review() -> None:
 
 
 @app.command()
-def mapping() -> None:
-    """Manage the Mappings between Figma nodes and DOM selectors. (stub)"""
-    _stub("mapping", 18)
+def mapping(
+    figma: str = typer.Option(  # noqa: B008
+        ...,
+        "--figma",
+        help="Figma URL — Frame, Component Instance, or Master Component.",
+    ),
+    route: str = typer.Option(  # noqa: B008
+        ...,
+        "--route",
+        help="URL of the Render (e.g. http://localhost:3000/foo).",
+    ),
+    viewport: str = typer.Option(  # noqa: B008
+        "1280x720",
+        "--viewport",
+        help="Viewport size as WIDTHxHEIGHT (default 1280x720).",
+    ),
+    out: Optional[Path] = typer.Option(  # noqa: B008, UP007
+        None,
+        "--out",
+        help="Write the AXI envelope JSON to this file. Defaults to stdout.",
+    ),
+) -> None:
+    """Resolve Figma <-> DOM Mappings and write .pixel-mcp/mappings.json."""
+    envelope, exit_code = mapping_cmd_mod.run(
+        figma_url=figma,
+        route=route,
+        viewport=_parse_viewport(viewport),
+    )
+    _emit(envelope, out)
+    raise typer.Exit(code=exit_code)
 
 
 @app.command()

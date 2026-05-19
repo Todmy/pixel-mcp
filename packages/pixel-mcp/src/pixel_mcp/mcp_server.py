@@ -18,6 +18,7 @@ from pixel_mcp import check_cmd as check_cmd_mod
 from pixel_mcp import diff_cmd as diff_cmd_mod
 from pixel_mcp import doctor as doctor_mod
 from pixel_mcp import judge_cmd as judge_cmd_mod
+from pixel_mcp import mapping_cmd as mapping_cmd_mod
 from pixel_mcp import measure_cmd as measure_cmd_mod
 from pixel_mcp import spec_cmd as spec_cmd_mod
 
@@ -167,6 +168,32 @@ def check(
         wait_for=wait_for,
         refresh_spec=refresh_spec,
         treat_minor_as_blocking=treat_minor_as_blocking,
+    )
+    serialized: dict[str, Any] = json.loads(json.dumps(envelope, default=str))
+    return serialized
+
+
+@server.tool()
+def mapping(
+    figma_url: str,
+    route: str,
+    viewport_width: int = 1280,
+    viewport_height: int = 720,
+) -> dict[str, Any]:
+    """Resolve Figma node <-> DOM selector Mappings and write to disk.
+
+    Args:
+        figma_url: Figma Frame / Instance / Component URL.
+        route: URL of the Render (e.g. http://localhost:3000/foo).
+        viewport_width: Browser viewport width in CSS px. Default 1280.
+        viewport_height: Browser viewport height. Default 720.
+
+    Returns the AXI envelope wrapping the Mappings container.
+    """
+    envelope, _exit_code = mapping_cmd_mod.run(
+        figma_url=figma_url,
+        route=route,
+        viewport=(viewport_width, viewport_height),
     )
     serialized: dict[str, Any] = json.loads(json.dumps(envelope, default=str))
     return serialized
