@@ -241,6 +241,66 @@ def _check_pixel_mcp_ml_vlm() -> CheckResult:
     }
 
 
+def _check_ollama_qwen() -> CheckResult:
+    """Probe a local Ollama daemon + the ``qwen2.5vl`` model presence.
+
+    Tri-state, ALWAYS fast (1-second HTTP timeout):
+
+    - green: daemon reachable AND ``qwen2.5vl`` model in ``/api/tags``.
+    - amber: daemon reachable but model missing — operator must pull it.
+    - red:   daemon unreachable — Ollama not running / not installed.
+
+    Honours ``OLLAMA_HOST`` so devs running Ollama on a remote box (or a
+    non-default port) get an accurate reading. We avoid the inference
+    path here — a tags call is cheap and never warms a model.
+    """
+    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    try:
+        import httpx  # local import — doctor must still work without it
+    except ImportError:
+        return {
+            "name": "ollama_qwen",
+            "status": "amber",
+            "detail": "Skipped — httpx not importable",
+        }
+    try:
+        response = httpx.get(f"{host}/api/tags", timeout=1.0)
+    except Exception as exc:  # noqa: BLE001 — any failure means unreachable
+        return {
+            "name": "ollama_qwen",
+            "status": "red",
+            "detail": f"Ollama unreachable at {host}: {exc.__class__.__name__}",
+        }
+    if response.status_code != 200:
+        return {
+            "name": "ollama_qwen",
+            "status": "red",
+            "detail": f"Ollama at {host} returned HTTP {response.status_code}",
+        }
+    try:
+        body = response.json()
+    except ValueError:
+        return {
+            "name": "ollama_qwen",
+            "status": "red",
+            "detail": f"Ollama at {host} returned non-JSON body",
+        }
+    models = body.get("models", []) if isinstance(body, dict) else []
+    names = [m.get("name", "") for m in models if isinstance(m, dict)]
+    has_qwen = any("qwen2.5vl" in (name or "") for name in names)
+    if has_qwen:
+        return {
+            "name": "ollama_qwen",
+            "status": "green",
+            "detail": f"Ollama reachable at {host} with qwen2.5vl present",
+        }
+    return {
+        "name": "ollama_qwen",
+        "status": "amber",
+        "detail": f"Ollama reachable at {host} but qwen2.5vl model missing",
+    }
+
+
 def _check_uv() -> CheckResult:
     path = shutil.which("uv")
     if path:
@@ -266,6 +326,7 @@ def run_checks() -> list[CheckResult]:
         _check_figma_api_reachable(),
         _check_pixel_mcp_ml(),
         _check_pixel_mcp_ml_vlm(),
+        _check_ollama_qwen(),
         _check_uv(),
     ]
 
@@ -290,6 +351,11 @@ def _hints_for(checks: list[CheckResult]) -> list[str]:
             hints.append(
                 "Install pixel-mcp-ml: `uv tool install pixel-mcp-ml` "
                 "(Level 2 VLM verification gate)."
+            )
+        elif c["name"] == "ollama_qwen":
+            hints.append(
+                "Start Ollama: `ollama serve` (one-time install: "
+                "`brew install ollama`). Only required for `--backend qwen-local`."
             )
     for c in checks:
         if c["status"] != "amber":
@@ -322,6 +388,12 @@ def _hints_for(checks: list[CheckResult]) -> list[str]:
             hints.append(
                 "Install VLM extras: `uv tool install pixel-mcp-ml --extra vlm` "
                 "(adds anthropic SDK for the Claude backend)."
+            )
+        elif c["name"] == "ollama_qwen":
+            hints.append(
+                "Pull the Qwen2.5-VL model into Ollama: "
+                "`ollama pull qwen2.5vl:7b` (~5GB). "
+                "Only required for `--backend qwen-local`."
             )
     return hints
 
@@ -373,7 +445,19 @@ def build_envelope() -> Envelope:
     )
 
 
+_OPTIONAL_RED_CHECKS = frozenset({"ollama_qwen"})
+"""Checks whose red status is informational, not fatal.
+
+The ``qwen-local`` backend is an opt-in alternative to the default
+Claude path — most operators never need it, so an unreachable Ollama
+daemon should not flip the doctor exit code."""
+
+
 def exit_code_for(envelope: Envelope) -> int:
-    """Exit 0 unless any Check is red."""
+    """Exit 0 unless any non-optional Check is red."""
     checks: list[CheckResult] = envelope["data"]["checks"]
-    return 1 if any(c["status"] == "red" for c in checks) else 0
+    return (
+        1
+        if any(c["status"] == "red" and c["name"] not in _OPTIONAL_RED_CHECKS for c in checks)
+        else 0
+    )

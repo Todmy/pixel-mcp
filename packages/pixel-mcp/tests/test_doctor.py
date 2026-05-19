@@ -37,6 +37,7 @@ def test_doctor_envelope_includes_python_check() -> None:
         "figma_api_reachable",
         "pixel_mcp_ml",
         "pixel_mcp_ml_vlm",
+        "ollama_qwen",
         "uv",
     } <= names
 
@@ -225,6 +226,107 @@ def test_pixel_mcp_ml_extras_are_independent(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(importlib.util, "find_spec", fake_find)
     assert doctor_mod._check_pixel_mcp_ml()["status"] == "green"
     assert doctor_mod._check_pixel_mcp_ml_vlm()["status"] == "amber"
+
+
+def test_ollama_qwen_check_green_when_model_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Daemon reachable + qwen2.5vl tag listed → green."""
+    import httpx as httpx_mod
+
+    fake_response = pytest.MonkeyPatch  # placeholder
+    fake_response = type(
+        "Resp",
+        (),
+        {
+            "status_code": 200,
+            "json": lambda self: {"models": [{"name": "qwen2.5vl:7b"}]},
+        },
+    )()
+
+    def fake_get(url: str, timeout: float = 1.0) -> object:
+        assert url.endswith("/api/tags")
+        return fake_response
+
+    monkeypatch.setattr(httpx_mod, "get", fake_get)
+    result = doctor_mod._check_ollama_qwen()
+    assert result["status"] == "green"
+    assert "qwen2.5vl" in result["detail"]
+
+
+def test_ollama_qwen_check_amber_when_model_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Daemon reachable but no qwen2.5vl tag → amber."""
+    import httpx as httpx_mod
+
+    fake_response = type(
+        "Resp",
+        (),
+        {
+            "status_code": 200,
+            "json": lambda self: {"models": [{"name": "llama3:8b"}]},
+        },
+    )()
+
+    monkeypatch.setattr(httpx_mod, "get", lambda url, timeout=1.0: fake_response)
+    result = doctor_mod._check_ollama_qwen()
+    assert result["status"] == "amber"
+    assert "missing" in result["detail"]
+
+
+def test_ollama_qwen_check_red_when_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ConnectError → red with diagnostic name."""
+    import httpx as httpx_mod
+
+    def raising(url: str, timeout: float = 1.0) -> object:
+        raise httpx_mod.ConnectError("Connection refused")
+
+    monkeypatch.setattr(httpx_mod, "get", raising)
+    result = doctor_mod._check_ollama_qwen()
+    assert result["status"] == "red"
+    assert "unreachable" in result["detail"]
+
+
+def test_ollama_qwen_red_does_not_flip_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Optional ollama_qwen red must not break the overall doctor exit code.
+
+    The Qwen backend is an opt-in alternative to the Claude default —
+    most operators never run Ollama, so doctor must stay exit 0 in that
+    case (assuming every other check is green/amber).
+    """
+    import httpx as httpx_mod
+
+    def raising(url: str, timeout: float = 1.0) -> object:
+        raise httpx_mod.ConnectError("Connection refused")
+
+    monkeypatch.setattr(httpx_mod, "get", raising)
+    env = doctor_mod.build_envelope()
+    # The only red in this scenario should be ollama_qwen — exit code 0.
+    reds = [c["name"] for c in env["data"]["checks"] if c["status"] == "red"]
+    assert "ollama_qwen" in reds
+    # ``figma_api_reachable`` may also flip to amber, never red here.
+    non_optional_reds = [n for n in reds if n != "ollama_qwen"]
+    if not non_optional_reds:
+        assert doctor_mod.exit_code_for(env) == 0
+
+
+def test_ollama_qwen_respects_ollama_host_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OLLAMA_HOST env overrides the probed endpoint."""
+    import httpx as httpx_mod
+
+    captured: dict[str, str] = {}
+
+    def fake_get(url: str, timeout: float = 1.0) -> object:
+        captured["url"] = url
+        raise httpx_mod.ConnectError("nope")
+
+    monkeypatch.setenv("OLLAMA_HOST", "http://elsewhere:7777")
+    monkeypatch.setattr(httpx_mod, "get", fake_get)
+    doctor_mod._check_ollama_qwen()
+    assert captured["url"] == "http://elsewhere:7777/api/tags"
 
 
 def test_no_stub_subcommands_remain(runner: CliRunner) -> None:

@@ -1403,6 +1403,7 @@ name = "pixel-mcp-ml"
 version = "0.1.0"
 source = { editable = "packages/pixel-mcp-ml" }
 dependencies = [
+    { name = "httpx" },
     { name = "numpy" },
     { name = "pillow" },
     { name = "typer" },
@@ -1421,6 +1422,7 @@ vlm = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", marker = "extra == 'vlm'", specifier = ">=0.40" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "safetensors", marker = "extra == 'dinov2'", specifier = ">=0.4" },

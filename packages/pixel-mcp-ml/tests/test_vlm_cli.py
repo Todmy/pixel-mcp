@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 from pixel_mcp_ml import vlm_verify
 from pixel_mcp_ml.cli import app
-from pixel_mcp_ml.vlm_verify import VLMJudgment, VLMNotInstalledError
+from pixel_mcp_ml.vlm_verify import VLMJudgment, VLMNotInstalledError, VLMOllamaError
 from typer.testing import CliRunner
 
 
@@ -110,13 +110,15 @@ def test_vlm_verify_cli_missing_dependency_exits_twelve(
     assert "--extra vlm" in combined
 
 
-def test_vlm_verify_cli_qwen_not_implemented_exits_twelve(
+def test_vlm_verify_cli_qwen_ollama_unreachable_exits_twelve(
     monkeypatch: pytest.MonkeyPatch,
     tiny_image_factory: Any,
     runner: CliRunner,
 ) -> None:
+    """qwen-local backend with no Ollama running → exit 12 + actionable hint."""
+
     def raising(*args: Any, **kwargs: Any) -> VLMJudgment:
-        raise NotImplementedError("Qwen local backend lands in v1-2")
+        raise VLMOllamaError("connection refused", host="http://localhost:11434")
 
     monkeypatch.setattr("pixel_mcp_ml.cli.compute_vlm_judgment", raising)
 
@@ -126,7 +128,8 @@ def test_vlm_verify_cli_qwen_not_implemented_exits_twelve(
 
     assert result.exit_code == 12
     combined = (result.stderr or "") + (result.output or "")
-    assert "v1-2" in combined
+    assert "ollama serve" in combined
+    assert "qwen2.5vl" in combined
 
 
 def test_vlm_verify_cli_invalid_backend_exits_two(

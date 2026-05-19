@@ -30,6 +30,7 @@ from pixel_mcp_ml.dinov2_compare import (
 from pixel_mcp_ml.version import __version__
 from pixel_mcp_ml.vlm_verify import (
     VLMNotInstalledError,
+    VLMOllamaError,
     compute_vlm_judgment,
 )
 
@@ -126,7 +127,7 @@ def vlm_verify(
     backend: str = typer.Option(  # noqa: B008
         "claude",
         "--backend",
-        help="VLM backend: 'claude' (default) or 'qwen-local' (v1-2).",
+        help="VLM backend: 'claude' (default, Anthropic API) or 'qwen-local' (Ollama + qwen2.5vl).",
     ),
     model: str | None = typer.Option(  # noqa: B008
         None,
@@ -162,7 +163,13 @@ def vlm_verify(
     except VLMNotInstalledError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=12) from exc
+    except VLMOllamaError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=12) from exc
     except NotImplementedError as exc:
+        # Defence in depth — should no longer fire for any wired backend,
+        # but keep the same exit-code surface in case a future backend
+        # ships in STUB form.
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=12) from exc
 

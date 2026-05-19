@@ -6,6 +6,7 @@ Public surface:
 - :func:`compute_vlm_judgment_batch` — judge many pairs, reusing the client.
 - :class:`VLMJudgment` — structured verdict (Pydantic).
 - :class:`VLMNotInstalledError` — raised when the VLM backend SDK is missing.
+- :class:`VLMOllamaError` — raised when the local Ollama daemon is unreachable.
 
 This is the **Level 2 escalation gate** of the pixel-mcp Convergence Loop
 (PRD #10). Level 0 = pure CV (SSIM + Hot Regions). Level 1 = DINOv2 cosine
@@ -20,7 +21,9 @@ Backend dispatch
 The module exposes a tiny strategy interface through ``backend=``:
 
 - ``"claude"`` (default) — call the Anthropic API. Multi-image messages.
-- ``"qwen-local"`` — STUB. Reserved for v1-2 (Ollama + Qwen2.5-VL).
+- ``"qwen-local"`` — POST to a local Ollama daemon (``/api/chat``) running
+  ``qwen2.5vl``. Offline / API-cost-free Level 2. Endpoint defaults to
+  ``http://localhost:11434`` (override via ``OLLAMA_HOST`` env).
 
 Lazy imports
 ------------
@@ -46,6 +49,7 @@ from __future__ import annotations
 import base64
 import importlib
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -60,6 +64,21 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 Per Dmytro's instructions for v1-1 — Claude Sonnet 4.6 is the current
 generation. Future bump goes through here.
 """
+
+DEFAULT_QWEN_MODEL = "qwen2.5vl:7b"
+"""Default Ollama tag for the Qwen2.5-VL backend.
+
+Override per-call via the ``model=`` parameter. Operators with more VRAM
+budget can pull e.g. ``qwen2.5vl:32b`` and pass that explicitly.
+"""
+
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+"""Default Ollama daemon endpoint. Override via ``OLLAMA_HOST`` env."""
+
+_OLLAMA_TIMEOUT_SECONDS = 120.0
+"""VLM inference is genuinely slow on local CPU/MPS — give it room. Doctor
+checks use a different (1s) timeout; this constant only applies to the
+inference path."""
 
 _VLM_SYSTEM_PROMPT = (
     "You are a strict visual diff judge. You will receive two images: "
@@ -90,6 +109,26 @@ class VLMNotInstalledError(RuntimeError):
             "Install the VLM extras: `uv tool install pixel-mcp-ml --extra vlm`"
         )
         self.missing = missing
+
+
+class VLMOllamaError(RuntimeError):
+    """Raised when the local Ollama daemon is unreachable or unhealthy.
+
+    Distinct from :class:`VLMNotInstalledError` (which is an *SDK* gap):
+    here the Python deps are fine, but the runtime service the qwen-local
+    backend depends on isn't responding. Message includes the canonical
+    setup commands so the operator can self-rescue.
+    """
+
+    def __init__(self, detail: str, *, host: str | None = None) -> None:
+        host_str = host or DEFAULT_OLLAMA_HOST
+        super().__init__(
+            f"Ollama call to {host_str} failed: {detail}. "
+            "Start it with `ollama serve` (one-time install: "
+            "`brew install ollama`), then `ollama pull qwen2.5vl:7b`."
+        )
+        self.detail = detail
+        self.host = host_str
 
 
 class VLMJudgment(BaseModel):
@@ -248,23 +287,108 @@ def _make_anthropic_client() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Backend: Qwen local — STUB for v1-1
+# Backend: Qwen local (Ollama + qwen2.5vl)
 # ---------------------------------------------------------------------------
+
+
+def _ollama_host() -> str:
+    """Resolve the Ollama endpoint, honouring the ``OLLAMA_HOST`` env var."""
+    return os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST).rstrip("/")
+
+
+def _build_qwen_messages(
+    expected_image: str | Path, actual_image: str | Path
+) -> list[dict[str, Any]]:
+    """Ollama ``/api/chat`` payload — system + user (with two image b64s).
+
+    Ollama accepts multiple base64 images per message via the ``images``
+    list; we don't bother sending media types — Ollama sniffs them from
+    the bytes. The user text reuses the same expected→actual framing as
+    the Claude path so model prompts stay comparable.
+    """
+    _, exp_b64 = _image_to_base64(expected_image)
+    _, act_b64 = _image_to_base64(actual_image)
+    return [
+        {"role": "system", "content": _VLM_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "Image 1 is the EXPECTED design crop. Image 2 is the "
+                "ACTUAL rendered crop. Judge per system instructions."
+            ),
+            "images": [exp_b64, act_b64],
+        },
+    ]
 
 
 def _qwen_judgment(
     expected_image: str | Path,
     actual_image: str | Path,
     model: str | None,
+    client: Any | None = None,
 ) -> VLMJudgment:
-    """Placeholder for the local Qwen2.5-VL backend (v1-2 scope).
+    """Single-pair Qwen verdict via Ollama ``/api/chat``.
 
-    Always raises ``NotImplementedError`` with a pointer to the next slice.
+    ``client`` is a reusable ``httpx.Client`` threaded through by the
+    batch helper. When ``None``, we construct a one-shot client here.
+    Lazy ``import httpx`` — if pixel-mcp-ml is somehow installed without
+    httpx, we surface the standard :class:`VLMNotInstalledError`.
     """
-    raise NotImplementedError(
-        "Qwen local backend lands in v1-2 (Ollama + Qwen2.5-VL). "
-        "For v1-1 use backend='claude' with ANTHROPIC_API_KEY set."
-    )
+    try:
+        httpx = importlib.import_module("httpx")
+    except ImportError as exc:
+        raise VLMNotInstalledError("httpx") from exc
+
+    chosen_model = model or DEFAULT_QWEN_MODEL
+    host = _ollama_host()
+    url = f"{host}/api/chat"
+    payload = {
+        "model": chosen_model,
+        "messages": _build_qwen_messages(expected_image, actual_image),
+        "stream": False,
+    }
+
+    owns_client = client is None
+    active_client: Any = httpx.Client(timeout=_OLLAMA_TIMEOUT_SECONDS) if owns_client else client
+    try:
+        try:
+            response = active_client.post(url, json=payload)
+        except httpx.ConnectError as exc:
+            raise VLMOllamaError(f"connection refused ({exc})", host=host) from exc
+        except httpx.TimeoutException as exc:
+            raise VLMOllamaError(f"request timed out ({exc})", host=host) from exc
+        except httpx.HTTPError as exc:
+            raise VLMOllamaError(
+                f"HTTP transport error ({exc.__class__.__name__}: {exc})",
+                host=host,
+            ) from exc
+
+        if response.status_code != 200:
+            raise VLMOllamaError(
+                f"non-200 response: HTTP {response.status_code} {response.text[:200]!r}",
+                host=host,
+            )
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise VLMOllamaError(
+                f"non-JSON response body: {response.text[:200]!r}", host=host
+            ) from exc
+    finally:
+        if owns_client:
+            active_client.close()
+
+    # Ollama returns ``{"message": {"role": "assistant", "content": "..."}, ...}``.
+    message = body.get("message") if isinstance(body, dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str):
+        return VLMJudgment(
+            verdict="ambiguous",
+            confidence=0.0,
+            reasoning="Ollama response had no message.content string.",
+        )
+    return _safe_parse_judgment(content)
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +407,8 @@ def compute_vlm_judgment(
     Returns a :class:`VLMJudgment`. Never raises on parse failure — falls
     back to ``ambiguous`` / confidence 0.0. Does raise
     :class:`VLMNotInstalledError` if the chosen backend's SDK is missing,
-    and ``NotImplementedError`` for the ``qwen-local`` STUB.
+    and :class:`VLMOllamaError` if the Qwen backend can't reach the
+    local Ollama daemon.
     """
     if backend == "claude":
         return _claude_judgment(expected_image, actual_image, model=model)
@@ -297,22 +422,31 @@ def compute_vlm_judgment_batch(
     backend: Backend = "claude",
     model: str | None = None,
 ) -> list[VLMJudgment]:
-    """Batched Level 2 — one Anthropic client construction for N pairs.
+    """Batched Level 2 — one backend client construction for N pairs.
 
-    The Anthropic API does not have a multi-pair batch endpoint with the
-    response shape we need, so we loop sequentially but reuse the client
-    across pairs (skips per-call TLS setup and re-reads of env vars).
+    Neither Anthropic nor Ollama exposes a multi-pair batch endpoint with
+    the response shape we want, so we loop sequentially but reuse one
+    client across pairs (skips per-call TLS setup, env re-reads, and
+    HTTP connection pool warmup).
     """
     if not pairs:
         return []
+    if backend == "claude":
+        client = _make_anthropic_client()
+        out: list[VLMJudgment] = []
+        for expected_image, actual_image in pairs:
+            out.append(_claude_judgment(expected_image, actual_image, model=model, client=client))
+        return out
     if backend == "qwen-local":
-        # Force the same error every other entry point would surface.
-        return [_qwen_judgment(a, b, model=model) for a, b in pairs]
-    if backend != "claude":
-        raise ValueError(f"Unknown VLM backend: {backend!r}")
-
-    client = _make_anthropic_client()
-    out: list[VLMJudgment] = []
-    for expected_image, actual_image in pairs:
-        out.append(_claude_judgment(expected_image, actual_image, model=model, client=client))
-    return out
+        try:
+            httpx = importlib.import_module("httpx")
+        except ImportError as exc:
+            raise VLMNotInstalledError("httpx") from exc
+        out_q: list[VLMJudgment] = []
+        with httpx.Client(timeout=_OLLAMA_TIMEOUT_SECONDS) as client:
+            for expected_image, actual_image in pairs:
+                out_q.append(
+                    _qwen_judgment(expected_image, actual_image, model=model, client=client)
+                )
+        return out_q
+    raise ValueError(f"Unknown VLM backend: {backend!r}")
